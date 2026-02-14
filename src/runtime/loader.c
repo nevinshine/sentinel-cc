@@ -2,11 +2,12 @@
 // Phase 1.2: Reads policy directly from the ELF .sentinel section (PCC)
 // Precise Labels: Keys are exact syscall instruction addresses.
 
-#include "sentinel.skel.h"
+#include "../../sentinel.skel.h"
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <fcntl.h>
 #include <gelf.h>
+#include <keyutils.h>
 #include <libelf.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
@@ -83,14 +84,46 @@ void verify_signature(const char *binary_path, const char *pubkey_path) {
     exit(1);
   }
 
-  // Load Public Key
-  FILE *fp = fopen(pubkey_path, "r");
-  if (!fp) {
-    perror("open pubkey");
+  // Load Public Key from Linux Kernel Keyring
+  // Phase 1.4: Root of Trust. Key is not on disk (pub.pem), but in kernel.
+  // We use the "User" keyring for this demo. Production would use
+  // ".builtin_trusted_keys".
+
+  // 1. Search for the key by description "sentinel:pubkey"
+  key_serial_t key_id =
+      keyctl_search(KEY_SPEC_USER_KEYRING, "user", "sentinel:pubkey", 0);
+  if (key_id == -1) {
+    perror("[FATAL] Public key not found in Kernel Keyring");
+    fprintf(stderr, "Hint: Did you run 'keyctl add user sentinel:pubkey "
+                    "\"$(cat pub.pem)\" @u'?\n");
     exit(1);
   }
-  EVP_PKEY *pub = PEM_read_PUBKEY(fp, NULL, NULL, NULL);
-  fclose(fp);
+
+  // 2. Read key size
+  long key_len = keyctl_read(key_id, NULL, 0);
+  if (key_len < 0) {
+    perror("keyctl_read size");
+    exit(1);
+  }
+
+  // 3. Allocate buffer and read key
+  char *key_buf = malloc(key_len);
+  if (!key_buf) {
+    perror("malloc");
+    exit(1);
+  }
+  if (keyctl_read(key_id, key_buf, key_len) < 0) {
+    perror("keyctl_read data");
+    exit(1);
+  }
+
+  // 4. Parse PEM from memory
+  BIO *bio = BIO_new_mem_buf(key_buf, key_len);
+  EVP_PKEY *pub = PEM_read_bio_PUBKEY(bio, NULL, NULL, NULL);
+
+  BIO_free(bio);
+  free(key_buf);
+
   if (!pub)
     handle_openssl_error();
 

@@ -48,7 +48,7 @@ sentinel.skel.h: sentinel.bpf.o
 # --- 5. Build Loader ---
 # Added -I. to find sentinel.skel.h in root
 loader: $(SRC_RUNTIME)/loader.c sentinel.skel.h
-	$(CLANG) -g -O2 -I. $(SRC_RUNTIME)/loader.c -lbpf -lelf -lcrypto -o loader
+	$(CLANG) -g -O2 -I. $(SRC_RUNTIME)/loader.c -lbpf -lelf -lcrypto -lkeyutils -o loader
 
 # --- Execution ---
 run: all
