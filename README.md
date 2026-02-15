@@ -147,3 +147,6 @@ Verified that TGID-based PID tracking correctly covers all threads in a process,
 sudo ./loader ./victim_threaded
 # Expected: All 3 threads print successfully.
 ```
+---
+
+@Nevin Shine (System Security Student) 2026
