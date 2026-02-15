@@ -4,7 +4,6 @@ BPFTOOL ?= bpftool
 ARCH ?= $(shell uname -m | sed 's/x86_64/x86/')
 
 # --- Directories ---
-# Ensure these exist! (Run the structure script if you haven't)
 SRC_KERNEL  := src/kernel
 SRC_RUNTIME := src/runtime
 SRC_COMPILER:= src/compiler
@@ -13,7 +12,7 @@ TESTS       := tests
 # --- Targets ---
 all: victim loader
 
-# 0. Prerequisites: Generate vmlinux.h
+# 0. Prerequisites
 vmlinux.h:
 	$(BPFTOOL) btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
 
@@ -26,7 +25,7 @@ $(SRC_COMPILER)/build/SentinelPass.so:
 sign_tool: $(SRC_RUNTIME)/sign_tool.c
 	$(CC) -O2 $(SRC_RUNTIME)/sign_tool.c -lelf -lcrypto -o sign_tool
 
-# 3. Generate Keys (Fixed Syntax Error)
+# 3. Generate Keys
 keys:
 	@if [ ! -f priv.pem ]; then \
 		echo "[Keys] Generating RSA-2048 Keypair..."; \
@@ -38,6 +37,12 @@ keys:
 victim: $(TESTS)/victim.c $(SRC_COMPILER)/build/SentinelPass.so sign_tool keys
 	$(CLANG) -fpass-plugin=$(SRC_COMPILER)/build/SentinelPass.so -O2 -fPIE -pie $(TESTS)/victim.c -o victim
 	./sign_tool victim priv.pem
+
+# 4b. Phase 2 Victim (Dynamic Linked - Uses Libc)
+victim_phase2: $(TESTS)/victim_phase2.c $(SRC_COMPILER)/build/SentinelPass.so sign_tool keys
+	# Compile as standard Dynamic Executable (uses libc.so)
+	$(CLANG) -fpass-plugin=$(SRC_COMPILER)/build/SentinelPass.so -O2 $(TESTS)/victim_phase2.c -o victim_phase2
+	./sign_tool victim_phase2 priv.pem
 
 # 5. Build Kernel Enforcer
 sentinel.bpf.o: $(SRC_KERNEL)/sentinel.bpf.c vmlinux.h
@@ -55,5 +60,5 @@ run: all
 	sudo ./loader ./victim
 
 clean:
-	rm -f victim loader sign_tool sentinel.bpf.o sentinel.skel.h priv.pem pub.pem vmlinux.h
+	rm -f victim victim_phase2 loader sign_tool sentinel.bpf.o sentinel.skel.h priv.pem pub.pem vmlinux.h
 	rm -rf $(SRC_COMPILER)/build

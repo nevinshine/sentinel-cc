@@ -94,18 +94,28 @@ struct SentinelPass : public PassInfoMixin<SentinelPass> {
       PolicyEntries.push_back(Entry);
     }
 
+    // Step B: Create the Global Policy Array (Always, even if empty)
+    if (PolicyEntries.empty()) {
+      errs() << "[Sentinel] No syscalls found. Creating dummy entry to prevent "
+                "stripping.\n";
+      Constant *NullPtr = Constant::getNullValue(VoidPtrTy);
+      Constant *Zero = ConstantInt::get(Int64Ty, 0);
+      Constant *Dummy =
+          ConstantStruct::get(PolicyEntryTy, {NullPtr, NullPtr, Zero});
+      PolicyEntries.push_back(Dummy);
+    }
+
+    ArrayType *ArrayTy = ArrayType::get(PolicyEntryTy, PolicyEntries.size());
+    Constant *ArrayInit = ConstantArray::get(ArrayTy, PolicyEntries);
+
+    GlobalVariable *PolicyTable =
+        new GlobalVariable(M, ArrayTy, true, GlobalValue::ExternalLinkage,
+                           ArrayInit, "__sentinel_policy");
+
+    PolicyTable->setSection(".sentinel");
+    PolicyTable->setAlignment(Align(16));
+
     if (!PolicyEntries.empty()) {
-      // Step B: Create the Global Policy Array
-      ArrayType *ArrayTy = ArrayType::get(PolicyEntryTy, PolicyEntries.size());
-      Constant *ArrayInit = ConstantArray::get(ArrayTy, PolicyEntries);
-
-      GlobalVariable *PolicyTable =
-          new GlobalVariable(M, ArrayTy, true, GlobalValue::ExternalLinkage,
-                             ArrayInit, "__sentinel_policy");
-
-      PolicyTable->setSection(".sentinel");
-      PolicyTable->setAlignment(Align(16));
-
       errs() << "[Sentinel] Injected " << PolicyEntries.size()
              << " precise entries into .sentinel section.\n";
     }
@@ -162,6 +172,13 @@ struct SentinelPass : public PassInfoMixin<SentinelPass> {
     Constant *SigCast =
         ConstantExpr::getBitCast(SigVar, PointerType::getUnqual(Ctx));
     UsedArray.push_back(SigCast);
+
+    // Also add PolicyTable to llvm.used so it isn't stripped
+    if (PolicyTable) {
+      Constant *PolicyCast =
+          ConstantExpr::getBitCast(PolicyTable, PointerType::getUnqual(Ctx));
+      UsedArray.push_back(PolicyCast);
+    }
 
     ArrayType *ATy =
         ArrayType::get(PointerType::getUnqual(Ctx), UsedArray.size());

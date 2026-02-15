@@ -86,7 +86,23 @@ Output:
 
 ## 📜 Status
 -   **Phase 1 (Complete)**: Static Binary Enforcement with Cryptographic Binding.
--   **Phase 2 (In Progress)**: Shared Library Support (`libc.so`).
+-   **Phase 2 (Complete)**: Shared Library Support (`libc.so`) with ASLR handling and Dynamic Map Updates.
+-   **Phase 3 (Planned)**: Deep CFI & Multithreading.
+
+## 🌟 Phase 2: Dynamic Enforcement (Real-World Apps)
+Sentinel-CC now supports dynamically linked binaries (like `nginx`, `redis`) that use shared libraries (`libc.so`).
+
+### Key Features
+1.  **ASLR Handling**: The loader dynamically parses `/proc/PID/maps` to find randomization offsets.
+2.  **Map-of-Maps**: Determining policy based on which module (Main Binary vs Libc) is executing.
+3.  **Session Keyring**: Utilizing the session keyring for ephemeral, secure signature verification without root-global state.
+
+### Verification (Phase 2)
+To see Sentinel handle ASLR and enforce policy on `libc` calls, run the automated script:
+```bash
+./verify_phase2.sh
+```
+This script handles the complex Session Keyring setup and launches the `victim_phase2` binary.
 
 ## License
 Research Prototype. MIT License.

@@ -1,7 +1,3 @@
-// loader.c
-// Phase 1.2: Reads policy directly from the ELF .sentinel section (PCC)
-// Precise Labels: Keys are exact syscall instruction addresses.
-
 #include "../../sentinel.skel.h"
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
@@ -13,21 +9,25 @@
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/ptrace.h>
+#include <sys/user.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
-// Must match the struct in SentinelPass.cpp associated with policy entries
-struct sentinel_entry {
-  uint64_t site_addr; // Exact address of the syscall instruction
-  uint64_t func_addr; // Address of the containing function
-  uint64_t size;      // Size (currently 0)
+// Phase 2 Constants
+#define MODULE_MAIN 1
+#define MODULE_LIBC 2
+
+struct vma_key {
+  u_int32_t prefixlen;
+  u_int64_t addr;
 };
 
-// Must match the struct in sentinel.bpf.c (Phase 3) map value
-struct policy_rule {
-  uint64_t allowed_caller_start;
-  uint64_t allowed_caller_end;
+struct vma_value {
+  u_int32_t module_id;
+  u_int64_t base_addr;
 };
 
 void handle_openssl_error() {
@@ -36,40 +36,29 @@ void handle_openssl_error() {
 }
 
 // -----------------------------------------------------------------------------
-// Verify Binary Signature
+// Verify Binary Signature (Kernel Keyring Phase 1.4)
 // -----------------------------------------------------------------------------
-void verify_signature(const char *binary_path, const char *pubkey_path) {
-  if (elf_version(EV_CURRENT) == EV_NONE) {
-    fprintf(stderr, "ELF Init Failed: %s\n", elf_errmsg(-1));
+void verify_signature(const char *binary_path) {
+  if (elf_version(EV_CURRENT) == EV_NONE)
     exit(1);
-  }
 
   int fd = open(binary_path, O_RDONLY);
-  if (fd < 0) {
-    perror("open binary");
+  if (fd < 0)
     exit(1);
-  }
 
   Elf *e = elf_begin(fd, ELF_C_READ, NULL);
-  if (!e) {
-    fprintf(stderr, "elf_begin Failed\n");
-    exit(1);
-  }
-
   size_t shstrndx;
   elf_getshdrstrndx(e, &shstrndx);
 
   Elf_Scn *scn = NULL;
   Elf_Data *text = NULL, *sentinel = NULL, *sig = NULL;
-  int found = 0;
-
   GElf_Shdr shdr;
+
   while ((scn = elf_nextscn(e, scn)) != NULL) {
     gelf_getshdr(scn, &shdr);
     char *name = elf_strptr(e, shstrndx, shdr.sh_name);
     if (!name)
       continue;
-
     if (strcmp(name, ".text") == 0)
       text = elf_getdata(scn, NULL);
     if (strcmp(name, ".sentinel") == 0)
@@ -79,55 +68,47 @@ void verify_signature(const char *binary_path, const char *pubkey_path) {
   }
 
   if (!text || !sentinel || !sig) {
-    fprintf(stderr, "[FATAL] Missing security sections in binary.\n");
-    fprintf(stderr, "This binary is NOT signed by the trust chain.\n");
+    fprintf(stderr, "[FATAL] Missing security sections.\n");
     exit(1);
   }
 
-  // Load Public Key from Linux Kernel Keyring
-  // Phase 1.4: Root of Trust. Key is not on disk (pub.pem), but in kernel.
-  // We use the "User" keyring for this demo. Production would use
-  // ".builtin_trusted_keys".
-
-  // 1. Search for the key by description "sentinel:pubkey"
+  // Load Public Key from Keyring (Session Keyring for Phase 2 Verification)
   key_serial_t key_id =
-      keyctl_search(KEY_SPEC_USER_KEYRING, "user", "sentinel:pubkey", 0);
+      keyctl_search(KEY_SPEC_SESSION_KEYRING, "user", "sentinel:pubkey", 0);
   if (key_id == -1) {
-    perror("[FATAL] Public key not found in Kernel Keyring");
-    fprintf(stderr, "Hint: Did you run 'keyctl add user sentinel:pubkey "
-                    "\"$(cat pub.pem)\" @u'?\n");
+    fprintf(stderr,
+            "[FATAL] Key 'sentinel:pubkey' not found in Session Keyring.\n");
     exit(1);
   }
 
-  // 2. Read key size
-  long key_len = keyctl_read(key_id, NULL, 0);
-  if (key_len < 0) {
-    perror("keyctl_read size");
+  long len = keyctl_read(key_id, NULL, 0);
+  if (len <= 0) {
+    perror("[Loader] keyctl_read failed");
+    fprintf(stderr, "[FATAL] Key length is invalid or 0.\n");
     exit(1);
   }
 
-  // 3. Allocate buffer and read key
-  char *key_buf = malloc(key_len);
-  if (!key_buf) {
-    perror("malloc");
-    exit(1);
-  }
-  if (keyctl_read(key_id, key_buf, key_len) < 0) {
-    perror("keyctl_read data");
+  char *buf = malloc(len);
+  if (!buf) {
+    perror("[FATAL] malloc failed");
     exit(1);
   }
 
-  // 4. Parse PEM from memory
-  BIO *bio = BIO_new_mem_buf(key_buf, key_len);
+  long read_len = keyctl_read(key_id, buf, len);
+  if (read_len != len) {
+    fprintf(stderr, "[FATAL] Key read incomplete.\n");
+    exit(1);
+  }
+
+  BIO *bio = BIO_new_mem_buf(buf, len);
   EVP_PKEY *pub = PEM_read_bio_PUBKEY(bio, NULL, NULL, NULL);
 
   BIO_free(bio);
-  free(key_buf);
+  free(buf);
 
   if (!pub)
     handle_openssl_error();
 
-  // Verify Hash
   EVP_MD_CTX *ctx = EVP_MD_CTX_new();
   if (EVP_DigestVerifyInit(ctx, NULL, EVP_sha256(), NULL, pub) <= 0)
     handle_openssl_error();
@@ -146,134 +127,163 @@ void verify_signature(const char *binary_path, const char *pubkey_path) {
     printf("[Loader] Signature Verified. Integrity Confirmed.\n");
   } else {
     fprintf(stderr,
-            "[FATAL] Signature Verification FAILED! Binary may be tampered.\n");
+            "[FATAL] Signature Verification FAILED! Binary tampered.\n");
     exit(1);
   }
 }
 
-int main(int argc, char **argv) {
-  setbuf(stdout, NULL); // Disable output buffering
+// Helper: Parse /proc/PID/maps to find Libc Base Address
+unsigned long get_libc_base(pid_t pid) {
+  char path[64], line[256];
+  snprintf(path, sizeof(path), "/proc/%d/maps", pid);
+  FILE *fp = fopen(path, "r");
+  if (!fp)
+    return 0;
 
-  if (argc < 2) {
-    fprintf(stderr, "Usage: %s <binary_path>\n", argv[0]);
-    return 1;
-  }
-
-  // Phase 1.3: Verify Signature BEFORE loading BPF
-  verify_signature(argv[1], "pub.pem");
-
-  // 1. Setup BPF
-  struct sentinel_bpf *skel;
-  int err;
-  skel = sentinel_bpf__open_and_load();
-  if (!skel) {
-    fprintf(stderr, "Failed to open and load BPF skeleton\n");
-    return 1;
-  }
-
-  if (sentinel_bpf__attach(skel)) {
-    fprintf(stderr, "Failed to attach BPF skeleton\n");
-    return 1;
-  }
-
-  // 2. Open ELF to find .sentinel section
-  if (elf_version(EV_CURRENT) == EV_NONE) {
-    fprintf(stderr, "ELF library initialization failed: %s\n", elf_errmsg(-1));
-    return 1;
-  }
-
-  int fd = open(argv[1], O_RDONLY, 0);
-  if (fd < 0) {
-    perror("Failed to open binary");
-    return 1;
-  }
-
-  Elf *e = elf_begin(fd, ELF_C_READ, NULL);
-  if (!e) {
-    fprintf(stderr, "elf_begin() failed: %s\n", elf_errmsg(-1));
-    return 1;
-  }
-
-  size_t shstrndx;
-  if (elf_getshdrstrndx(e, &shstrndx) != 0) {
-    fprintf(stderr, "elf_getshdrstrndx() failed: %s\n", elf_errmsg(-1));
-    return 1;
-  }
-
-  Elf_Scn *scn = NULL;
-  GElf_Shdr shdr;
-  Elf_Data *data = NULL;
-
-  printf("[Loader] Scanning ELF for .sentinel section...\n");
-
-  while ((scn = elf_nextscn(e, scn)) != NULL) {
-    gelf_getshdr(scn, &shdr);
-    char *name = elf_strptr(e, shstrndx, shdr.sh_name);
-
-    if (name && strcmp(name, ".sentinel") == 0) {
-      data = elf_getdata(scn, NULL);
+  unsigned long base = 0;
+  while (fgets(line, sizeof(line), fp)) {
+    if (strstr(line, "libc.so") || strstr(line, "libc-")) {
+      sscanf(line, "%lx", &base);
       break;
     }
   }
+  fclose(fp);
+  return base;
+}
 
-  if (!data) {
-    fprintf(stderr, "[Error] No .sentinel section found in binary!\n");
-    return 1;
-  }
+// Helper: Get Main Binary Base Address (for PIE binaries)
+unsigned long get_binary_base(pid_t pid, const char *bin_name) {
+  char path[64], line[256];
+  snprintf(path, sizeof(path), "/proc/%d/maps", pid);
+  FILE *fp = fopen(path, "r");
+  if (!fp)
+    return 0;
 
-  // 3. Load Policy from ELF into Kernel
-  int map_fd = bpf_map__fd(skel->maps.policy_map);
-  int count = shdr.sh_size / sizeof(struct sentinel_entry);
-  struct sentinel_entry *entries = (struct sentinel_entry *)data->d_buf;
-
-  printf("[Loader] Found %d precise policy entries. Loading into Kernel...\n",
-         count);
-
-  for (int i = 0; i < count; i++) {
-    // Phase 1.2: Site == Syscall Instruction Address (BlockAddress).
-    // BPF 'ip' is Address AFTER syscall (2 bytes '0f 05').
-    // So Map Key MUST be Site + 2.
-
-    unsigned long key = entries[i].site_addr + 2;
-
-    // Mocking the "Caller Range" for now (Self-Call within function).
-    // Since we don't extract exact function size yet, assume [Func, Func +
-    // 0x1000].
-    struct policy_rule val = {entries[i].func_addr,
-                              entries[i].func_addr + 0x1000};
-
-    int ret = bpf_map_update_elem(map_fd, &key, &val, BPF_ANY);
-    if (ret != 0) {
-      fprintf(stderr, "Failed to update map for 0x%lx: %d\n", key, ret);
-    } else {
-      printf(
-          "   [+] Allowed: 0x%lx (Instruction Offset matches Run-Time RIP)\n",
-          key);
+  unsigned long base = 0;
+  while (fgets(line, sizeof(line), fp)) {
+    if (strstr(line, bin_name)) { // Simplified match
+      sscanf(line, "%lx", &base);
+      break;
     }
   }
+  fclose(fp);
+  return base;
+}
 
-  // 4. Exec Victim in child process
+int main(int argc, char **argv) {
+  setbuf(stdout, NULL);
+  if (argc < 2)
+    return 1;
+
+  // 1. Verify Signature (Phase 1.4)
+  verify_signature(argv[1]);
+
+  // 2. Setup BPF
+  struct sentinel_bpf *skel = sentinel_bpf__open_and_load();
+  if (!skel)
+    return 1;
+  sentinel_bpf__attach(skel);
+
+  printf("[Loader] Launching victim '%s' with Ptrace synchronization...\n",
+         argv[1]);
+
+  // 3. Start Victim (Ptrace Traceme)
   pid_t child = fork();
   if (child == 0) {
+    // Allow parent to trace me
+    ptrace(PTRACE_TRACEME, 0, NULL, NULL);
+    // Exec triggers SIGTRAP to parent
     execv(argv[1], &argv[1]);
-    perror("execv failed");
+    perror("execv");
+    exit(1);
+  }
+
+  // 4. Parent waits for Child's exec() to complete
+  int status;
+  waitpid(child, &status, 0);
+
+  if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP) {
+    printf("[Loader] Trapped child at exec(). Waiting for Libc...\n");
+
+    unsigned long libc_base = 0;
+    unsigned long bin_base = 0;
+    int steps = 0;
+
+    // Loop until Libc is loaded (Dynamic Linker running)
+    // We ensure ld.so runs enough to map libc, but not enough to run main.
+    while (1) {
+      libc_base = get_libc_base(child);
+      if (libc_base != 0)
+        break; // Found it!
+
+      // Not yet. Let child run one syscall.
+      ptrace(PTRACE_SYSCALL, child, 0, 0);
+      waitpid(child, &status, 0);
+
+      if (WIFEXITED(status)) {
+        fprintf(stderr, "[Loader] Child exited before loading libc!\n");
+        return 1;
+      }
+      steps++;
+      if (steps > 10000) { // Safety break
+        fprintf(stderr, "[Loader] Timeout waiting for Libc.\n");
+        break;
+      }
+    }
+
+    bin_base = get_binary_base(child, "victim_phase2");
+
+    printf("[Loader] Detected Libc Base: 0x%lx (after %d syscall steps)\n",
+           libc_base, steps);
+    printf("[Loader] Detected Binary Base: 0x%lx\n", bin_base);
+
+    // 5. Update VMA Map (LPM Trie)
+    int vma_fd = bpf_map__fd(skel->maps.vma_map);
+
+    // Entry for Libc
+    struct vma_key k1 = {.prefixlen = 64, .addr = libc_base};
+    struct vma_value v1 = {.module_id = MODULE_LIBC, .base_addr = libc_base};
+    bpf_map_update_elem(vma_fd, &k1, &v1, BPF_ANY);
+
+    // Entry for Main Binary
+    struct vma_key k2 = {.prefixlen = 64, .addr = bin_base};
+    struct vma_value v2 = {.module_id = MODULE_MAIN, .base_addr = bin_base};
+    bpf_map_update_elem(vma_fd, &k2, &v2, BPF_ANY);
+
+    // 6. Create Inner Policy Maps
+    int registry_fd = bpf_map__fd(skel->maps.policy_registry);
+
+    // Create Libc Policy Map
+    int libc_map_fd =
+        bpf_map_create(BPF_MAP_TYPE_HASH, "libc_policy", sizeof(uint64_t),
+                       sizeof(uint64_t), 1024, NULL);
+    uint32_t mod_libc = MODULE_LIBC;
+    bpf_map_update_elem(registry_fd, &mod_libc, &libc_map_fd, BPF_ANY);
+
+    // Populate Libc Policy
+    // Offset for 'write' (from nm -D /lib64/libc.so.6)
+    uint64_t libc_write_offset = 0xe91e0;
+    uint64_t val = 1;
+    bpf_map_update_elem(libc_map_fd, &libc_write_offset, &val, BPF_ANY);
+
+    printf("[Loader] Whitelisted Libc 'write' at offset 0x%lx\n",
+           libc_write_offset);
+
+    // 7. Track PID (CRITICAL: Must be done before detach)
+    int pid_map = bpf_map__fd(skel->maps.target_pid_map);
+    uint32_t pid = child;
+    bpf_map_update_elem(pid_map, &pid, &pid, BPF_ANY);
+
+    printf("[Loader] Policy Loaded. Detaching to let child run.\n");
+    ptrace(PTRACE_DETACH, child, NULL, NULL);
+  } else {
+    fprintf(stderr, "[Loader] Failed to trap child (Status: %d)\n", status);
+    kill(child, SIGKILL);
     return 1;
   }
 
-  // Parent process: Set up PID map
-  int pid_map_fd = bpf_map__fd(skel->maps.target_pid_map);
-  u_int32_t pkey = 0, pval = child;
-  bpf_map_update_elem(pid_map_fd, &pkey, &pval, BPF_ANY);
-
-  printf("[Loader] Target PID: %d\n", child);
-  printf("[Loader] BPF enforcer active. Waiting for victim to finish...\n");
-
   wait(NULL);
-
-  // Cleanup
-  sentinel_bpf__destroy(skel);
-  elf_end(e);
-  close(fd);
-
+  if (skel)
+    sentinel_bpf__destroy(skel);
   return 0;
 }

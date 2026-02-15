@@ -1,45 +1,60 @@
-// sentinel.bpf.c
-// Sentinel-CC Phase 3 — Context-Sensitive Enforcement (CFI)
-// Enforces that syscalls are not only at allowed locations (Offsets),
-// but also originate from allowed CALLERS (Stack Check).
-
-#include "vmlinux.h"
+#include "../../vmlinux.h"
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 
-// Phase 3: Policy Rule now includes Caller Range
-struct policy_rule {
-  u64 allowed_caller_start;
-  u64 allowed_caller_end;
+// --- Phase 2: Map-of-Maps Architecture ---
+
+// 1. Inner Map Template (The Policy for a specific library)
+struct inner_policy_map {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 1024);
+  __type(key, u64);   // Offset (RIP - Base)
+  __type(value, u64); // Allowed Caller Start (Simplified for now)
+} inner_policy SEC(".maps");
+
+// 2. Policy Registry (Array of Maps)
+// Maps Module_ID -> Inner_Policy_Map
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
+  __uint(max_entries, 64);
+  __type(key, u32);
+  __array(values, struct inner_policy_map);
+} policy_registry SEC(".maps");
+
+// 3. VMA Trie (Longest Prefix Match)
+// Maps RIP -> {Module_ID, Base_Address}
+struct vma_key {
+  u32 prefixlen;
+  u64 addr;
 };
 
-// Map: Target PID
+struct vma_value {
+  u32 module_id;
+  u64 base_addr;
+};
+
 struct {
-  __uint(type, BPF_MAP_TYPE_ARRAY);
-  __uint(max_entries, 1);
+  __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+  __uint(max_entries, 256);
+  __uint(map_flags, BPF_F_NO_PREALLOC);
+  __type(key, struct vma_key);
+  __type(value, struct vma_value);
+} vma_map SEC(".maps");
+
+// 4. PID Tracking
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 16);
   __type(key, u32);
   __type(value, u32);
 } target_pid_map SEC(".maps");
 
-// Map: Policy (Syscall Offset -> Allowed Caller Range)
-struct {
-  __uint(type, BPF_MAP_TYPE_HASH);
-  __uint(max_entries, 1024);
-  __type(key, u64);                  // Syscall Instruction Offset
-  __type(value, struct policy_rule); // Requirement for Caller
-} policy_map SEC(".maps");
-
 SEC("fentry/__x64_sys_write")
 int BPF_PROG(sentinel_write_check) {
-  // 0. PID Filter
-  u32 key0 = 0;
-  u32 *target_pid = bpf_map_lookup_elem(&target_pid_map, &key0);
-  if (!target_pid || *target_pid == 0)
-    return 0;
-
   u32 pid = bpf_get_current_pid_tgid() >> 32;
-  if (pid != *target_pid)
+  u32 *target = bpf_map_lookup_elem(&target_pid_map, &pid);
+  if (!target)
     return 0;
 
   struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
@@ -47,52 +62,51 @@ int BPF_PROG(sentinel_write_check) {
   if (!regs)
     return 0;
 
-  // 1. IP Check (Base Enforcement)
-  unsigned long ip = PT_REGS_IP_CORE(regs);
-  unsigned long start_code = BPF_CORE_READ(task, mm, start_code);
-  unsigned long offset = ip - start_code;
+  // 1. Get Current RIP (ASLR Address)
+  u64 rip = PT_REGS_IP_CORE(regs);
+  // Syscall instruction is 2 bytes (0x0f 0x05), so the call site is RIP - 2
 
-  struct policy_rule *rule = bpf_map_lookup_elem(&policy_map, &offset);
-  if (!rule) {
-    // Unknown Syscall Location -> BLOCK
-    bpf_printk("Sentinel BLOCK: PID=%d SyscallInvalid 0x%lx", pid, offset);
+  // Note: BPF_CORE_READ(regs, rip) gets the instruction pointer *at the time of
+  // trap*. For fentry/kprobe, this is usually the start of the function, but
+  // for syscall tracepoints it's the return address in userspace (instruction
+  // after syscall). The user provided logic subtracts 2. We trust this matches
+  u64 syscall_site = rip - 2;
+
+  // 2. Lookup Module in VMA Trie
+  struct vma_key vkey = {.prefixlen = 64, .addr = syscall_site};
+  struct vma_value *mod = bpf_map_lookup_elem(&vma_map, &vkey);
+
+  if (!mod) {
+    bpf_printk("Sentinel BLOCK: PID=%d Unknown VMA region at 0x%lx", pid,
+               syscall_site);
     bpf_send_signal(9);
     return 0;
   }
 
-  // 2. Stack Verification (Phase 3)
-  // Who called this function?
-  // We retrieve the user stack to find the Return Address.
-  // stack[0] = IP (Next instruction after syscall, same as offset).
-  // stack[1] = Caller (Return Address).
-  u64 stack[4];
-  long ret = bpf_get_stack(ctx, stack, sizeof(stack), BPF_F_USER_STACK);
+  // 3. Normalize Address (Offset = RIP - Base)
+  u64 offset = syscall_site - mod->base_addr;
 
-  if (ret < 0) {
-    // Failed to walk stack -> Fail Secure
-    bpf_printk("Sentinel BLOCK: PID=%d StackWalkFail", pid);
+  // 4. Lookup Policy in Registry
+  // We need to find the specific map for this Module ID
+  void *policy_map = bpf_map_lookup_elem(&policy_registry, &mod->module_id);
+  if (!policy_map) {
+    bpf_printk("Sentinel BLOCK: PID=%d No policy for Module %d", pid,
+               mod->module_id);
     bpf_send_signal(9);
     return 0;
   }
 
-  // Normalize Caller IP to Offset
-  u64 caller_ip = stack[1];
-  u64 caller_offset = caller_ip - start_code;
-
-  // 3. CFI Check
-  if (caller_offset >= rule->allowed_caller_start &&
-      caller_offset <= rule->allowed_caller_end) {
-
-    bpf_printk("Sentinel ALLOW: PID=%d Syscall 0x%lx Caller 0x%lx (Valid)", pid,
-               offset, caller_offset);
+  // 5. Check Inner Policy
+  u64 *rule = bpf_map_lookup_elem(policy_map, &offset);
+  if (rule) {
+    bpf_printk("Sentinel ALLOW: Module %d Offset 0x%lx (Normalized)",
+               mod->module_id, offset);
     return 0;
   }
 
-  // 4. Violation Detected! (Valid Gadget, Invalid Caller)
-  bpf_printk("Sentinel BLOCK: PID=%d Syscall 0x%lx Caller 0x%lx (INVALID)", pid,
-             offset, caller_offset);
+  bpf_printk("Sentinel BLOCK: Module %d Offset 0x%lx (Violation)",
+             mod->module_id, offset);
   bpf_send_signal(9);
-
   return 0;
 }
 

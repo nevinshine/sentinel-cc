@@ -6,6 +6,7 @@
 
 # Executables
 victim
+victim_phase2
 loader
 sign_tool
 
