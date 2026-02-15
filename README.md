@@ -38,8 +38,11 @@ src/
     ├── loader.c    # Verifies signature & loads BPF
     └── sign_tool.c # RSA Signing Utility
 tests/
-├── victim.c        # Test program (The "Subject")
-└── ...
+├── victim.c            # Phase 1 test (inline syscalls)
+├── victim_phase2.c     # Phase 2.1 test (shared library / ASLR)
+├── victim_cfi.c        # Phase 2.2 test (Deep CFI caller validation)
+├── victim_threaded.c   # Phase 2.3 test (multithreading)
+└── policy_gen.py       # CFI policy extractor
 ```
 
 ## 🚀 Building & Running
@@ -53,7 +56,7 @@ tests/
 ```bash
 make clean && make
 ```
-This builds the Compiler Pass, the Runtime Tools, and compiles+signs the `victim` binary.
+This builds the Compiler Pass, the Runtime Tools, and compiles+signs all victim binaries.
 
 ### 2. Setup Root of Trust
 Sentinel respects the Linux Kernel Keyring. You must load the public key into your session keyring:
@@ -86,23 +89,40 @@ Output:
 
 ## 📜 Status
 -   **Phase 1 (Complete)**: Static Binary Enforcement with Cryptographic Binding.
--   **Phase 2 (Complete)**: Shared Library Support (`libc.so`) with ASLR handling and Dynamic Map Updates.
--   **Phase 3 (Planned)**: Deep CFI & Multithreading.
+-   **Phase 2 (Complete)**: Full Real-World Runtime Security.
 
-## 🌟 Phase 2: Dynamic Enforcement (Real-World Apps)
-Sentinel-CC now supports dynamically linked binaries (like `nginx`, `redis`) that use shared libraries (`libc.so`).
+## 🏗 Phase 2: Complete
 
-### Key Features
-1.  **ASLR Handling**: The loader dynamically parses `/proc/PID/maps` to find randomization offsets.
-2.  **Map-of-Maps**: Determining policy based on which module (Main Binary vs Libc) is executing.
-3.  **Session Keyring**: Utilizing the session keyring for ephemeral, secure signature verification without root-global state.
+### Phase 2.1: Shared Library Support (ASLR + Map-of-Maps)
+Sentinel-CC supports dynamically linked binaries (like `nginx`, `redis`) that use shared libraries (`libc.so`).
 
-### Verification (Phase 2)
-To see Sentinel handle ASLR and enforce policy on `libc` calls, run the automated script:
+-   **ASLR Handling**: The loader dynamically parses `/proc/PID/maps` to find randomization offsets.
+-   **Map-of-Maps**: Determining policy based on which module (Main Binary vs Libc) is executing.
+-   **Session Keyring**: Utilizing the session keyring for ephemeral, secure signature verification.
+
 ```bash
 ./verify_phase2.sh
 ```
-This script handles the complex Session Keyring setup and launches the `victim_phase2` binary.
+
+### Phase 2.2: Deep CFI (Call-Stack Validation)
+Not just *where* a syscall happens, but *who called it*. Uses eBPF `bpf_get_stack()` to walk the userspace call stack and validate that the return address falls within a compiler-declared valid caller range.
+
+-   **`cfi_policy` map**: Maps `syscall_offset → {caller_start, caller_end}`.
+-   **Stack Walking**: `bpf_get_stack(ctx, stack, sizeof(stack), BPF_F_USER_STACK)`.
+-   **Enforcement**: If caller RIP is outside the valid range → `SIGKILL`.
+
+```bash
+sudo ./loader ./victim_cfi
+# Expected: [SAFE] prints, then unsafe_caller is killed by Sentinel.
+```
+
+### Phase 2.3: Multithreading Stability
+Verified that TGID-based PID tracking (`bpf_get_current_pid_tgid() >> 32`) correctly covers all threads in a process.
+
+```bash
+sudo ./loader ./victim_threaded
+# Expected: All 3 threads print successfully.
+```
 
 ## License
 Research Prototype. MIT License.
