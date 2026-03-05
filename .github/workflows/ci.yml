@@ -36,29 +36,42 @@ jobs:
             libkeyutils-dev \
             cmake \
             linux-tools-common
-          # Symlink clang to versioned binary
+          # Create symlinks so Makefile's CLANG=clang and CC=cc resolve
           sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-${{ env.LLVM_VERSION }} 100
+          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-${{ env.LLVM_VERSION }} 100
+          sudo update-alternatives --install /usr/bin/llvm-config llvm-config /usr/bin/llvm-config-${{ env.LLVM_VERSION }} 100
+          # Verify the right version is active
+          clang --version
+          llvm-config --version
 
       - name: Build Compiler Pass
         run: |
           mkdir -p src/compiler/build
           cd src/compiler/build
-          cmake ..
+          cmake .. -DLLVM_DIR=$(llvm-config --cmakedir)
           make -j$(nproc)
+          # Verify the .so was built
+          ls -la SentinelPass.so
 
       - name: Build Signing Tool
-        run: make sign_tool
+        run: make CC=clang sign_tool
 
       - name: Generate Keys
         run: make keys
 
       - name: Build Victim Binaries
+        timeout-minutes: 5
         run: |
-          # Need vmlinux.h for loader, but we can build victims without it
-          make victim victim_phase2 victim_cfi victim_threaded victim_fork
+          # Build each victim individually for clearer error reporting
+          # Pass CLANG explicitly to ensure version match with the pass
+          for bin in victim victim_phase2 victim_cfi victim_threaded victim_fork; do
+            echo "=== Building $bin ==="
+            make CLANG=clang-${{ env.LLVM_VERSION }} "$bin"
+          done
 
       - name: Build Attack Binaries
-        run: make attacks
+        timeout-minutes: 5
+        run: make CLANG=clang-${{ env.LLVM_VERSION }} attacks
 
       - name: Verify ELF Sections
         run: |
@@ -108,6 +121,7 @@ jobs:
           bash -n benchmark.sh && echo "✓ benchmark.sh syntax OK"
 
       - name: Upload Binaries
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: sentinel-binaries
@@ -122,6 +136,7 @@ jobs:
             attack_*
             pub.pem
           retention-days: 7
+          if-no-files-found: warn
 
   # ═══════════════════════════════════════════════════════════════════
   # Tier 2: Integration Tests (self-hosted runner with BTF kernel)
