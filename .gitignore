@@ -4,17 +4,17 @@
 *.a
 *.so
 
-# Executables
-victim
-victim_phase2
-victim_cfi
-victim_threaded
-victim_fork
-victim_bench
-victim_tampered
-loader
-sign_tool
-attack_*
+# Executables (root-level compiled binaries only)
+/victim
+/victim_phase2
+/victim_cfi
+/victim_threaded
+/victim_fork
+/victim_bench
+/victim_tampered
+/loader
+/sign_tool
+/attack_*
 
 # BPF compiled output
 sentinel.bpf.o
@@ -40,14 +40,6 @@ pub.pem
 
 # --- Runtime Logs & Temp ---
 *.log
-policy.txt
-*.tmp
-
-# --- Editor Configs ---
-.vscode/
-.idea/
-*.swp
-.DS_Store
 policy.txt
 *.tmp
 
