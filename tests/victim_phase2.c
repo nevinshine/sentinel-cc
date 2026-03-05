@@ -1,5 +1,6 @@
 #include <fcntl.h>
 #include <stdio.h>
+#include <string.h>
 #include <unistd.h>
 
 // Phase 2 Victim: Uses libc (Shared Library)
@@ -14,6 +15,10 @@ int main() {
 
   printf("[Victim] Hello from Phase 2! Calling printf (which calls write in "
          "libc)...\n");
+
+  // Explicit libc write() — exercises the ASLR + Map-of-Maps enforcement path
+  const char *msg = "[Victim] Direct write() via libc.\n";
+  write(STDOUT_FILENO, msg, strlen(msg));
 
   // Explicit libc call
   FILE *fp = fopen("/dev/null", "w");

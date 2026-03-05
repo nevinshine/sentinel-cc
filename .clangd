@@ -1,0 +1,12 @@
+CompileFlags:
+  Add:
+    - "-I/home/nevinshine/cc"
+    - "-Wno-unknown-attributes"
+
+---
+# BPF files need special handling — suppress diagnostics since
+# they require -target bpf and vmlinux.h (generated at build time)
+If:
+  PathMatch: ".*\\.bpf\\.c"
+Diagnostics:
+  Suppress: "*"

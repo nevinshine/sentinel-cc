@@ -1,0 +1,165 @@
+# Sentinel-CC CI Pipeline
+# Tier 1: Build + static checks (runs on standard runners)
+# Tier 2: Full integration tests (requires self-hosted runner with BTF kernel)
+
+name: Sentinel-CC CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  LLVM_VERSION: 18
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════════
+  # Tier 1: Build & Static Analysis (standard GitHub runner)
+  # ═══════════════════════════════════════════════════════════════════
+  build:
+    name: Build & Verify
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang-${{ env.LLVM_VERSION }} \
+            llvm-${{ env.LLVM_VERSION }}-dev \
+            libclang-${{ env.LLVM_VERSION }}-dev \
+            libbpf-dev \
+            libelf-dev \
+            libssl-dev \
+            libkeyutils-dev \
+            cmake \
+            linux-tools-common
+          # Symlink clang to versioned binary
+          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-${{ env.LLVM_VERSION }} 100
+
+      - name: Build Compiler Pass
+        run: |
+          mkdir -p src/compiler/build
+          cd src/compiler/build
+          cmake ..
+          make -j$(nproc)
+
+      - name: Build Signing Tool
+        run: make sign_tool
+
+      - name: Generate Keys
+        run: make keys
+
+      - name: Build Victim Binaries
+        run: |
+          # Need vmlinux.h for loader, but we can build victims without it
+          make victim victim_phase2 victim_cfi victim_threaded victim_fork
+
+      - name: Build Attack Binaries
+        run: make attacks
+
+      - name: Verify ELF Sections
+        run: |
+          echo "=== Checking .sentinel sections ==="
+          for bin in victim victim_phase2 victim_cfi victim_threaded victim_fork; do
+            if readelf -S "$bin" | grep -q '.sentinel'; then
+              echo "✓ $bin has .sentinel"
+            else
+              echo "✗ $bin MISSING .sentinel" && exit 1
+            fi
+            if readelf -S "$bin" | grep -q '.signature'; then
+              echo "✓ $bin has .signature"
+            else
+              echo "✗ $bin MISSING .signature" && exit 1
+            fi
+          done
+
+      - name: Verify .sentinel_imports on dynamic binaries
+        run: |
+          for bin in victim_phase2 victim_fork; do
+            if readelf -S "$bin" | grep -q '.sentinel_imports'; then
+              echo "✓ $bin has .sentinel_imports"
+            else
+              echo "✗ $bin MISSING .sentinel_imports" && exit 1
+            fi
+          done
+
+      - name: Verify .sentinel_cfi sections
+        run: |
+          for bin in victim_cfi; do
+            if readelf -S "$bin" | grep -q '.sentinel_cfi'; then
+              echo "✓ $bin has .sentinel_cfi"
+            else
+              echo "✗ $bin MISSING .sentinel_cfi" && exit 1
+            fi
+          done
+
+      - name: Verify CLI Help
+        run: |
+          ./sign_tool --help | grep -q "Usage" && echo "✓ sign_tool --help"
+          ./sign_tool --version | grep -q "Sentinel-CC" && echo "✓ sign_tool --version"
+
+      - name: Script Syntax Check
+        run: |
+          bash -n tests/run_all.sh && echo "✓ run_all.sh syntax OK"
+          bash -n tests/red_team.sh && echo "✓ red_team.sh syntax OK"
+          bash -n benchmark.sh && echo "✓ benchmark.sh syntax OK"
+
+      - name: Upload Binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: sentinel-binaries
+          path: |
+            victim
+            victim_phase2
+            victim_cfi
+            victim_threaded
+            victim_fork
+            loader
+            sign_tool
+            attack_*
+            pub.pem
+          retention-days: 7
+
+  # ═══════════════════════════════════════════════════════════════════
+  # Tier 2: Integration Tests (self-hosted runner with BTF kernel)
+  # ═══════════════════════════════════════════════════════════════════
+  integration:
+    name: Integration Tests
+    needs: build
+    runs-on: [self-hosted, btf-kernel]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: sentinel-binaries
+
+      - name: Make Binaries Executable
+        run: chmod +x victim* loader sign_tool attack_*
+
+      - name: Build BPF (requires BTF)
+        run: |
+          # Need vmlinux.h and bpftool on the runner
+          make vmlinux.h
+          make sentinel.skel.h
+          make loader
+
+      - name: Setup Keyring
+        run: |
+          sudo keyctl add user sentinel:pubkey "$(cat pub.pem)" @s > /dev/null 2>&1
+          kid=$(sudo keyctl search @s user sentinel:pubkey 2>/dev/null)
+          sudo keyctl setperm "$kid" 0x3f3f3f3f 2>/dev/null || true
+
+      - name: Run Test Suite
+        run: sudo tests/run_all.sh
+
+      - name: Run Red Team Suite
+        run: sudo tests/red_team.sh
+
+      - name: Run Benchmark
+        run: sudo ./benchmark.sh
