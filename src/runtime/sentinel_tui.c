@@ -19,7 +19,7 @@
 #define MAX_SYSCALLS 512
 
 // --- ANSI escape codes ---
-#define CLR     "\033[2J\033[H"
+#define CLR     "\033[H\033[J"
 #define BOLD    "\033[1m"
 #define DIM     "\033[2m"
 #define RED     "\033[31m"
