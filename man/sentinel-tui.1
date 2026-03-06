@@ -1,0 +1,57 @@
+.TH SENTINEL-TUI 1 "March 2026" "Sentinel-CC v4.2.0" "User Commands"
+.SH NAME
+sentinel-tui \- Sentinel-CC terminal dashboard
+.SH SYNOPSIS
+.B sentinel-loader
+\-\-audit \-\-audit-format=json \fIBINARY\fR |
+.B sentinel-tui
+.SH DESCRIPTION
+.B sentinel-tui
+reads JSON audit events from standard input and displays a live terminal
+dashboard with aggregate counters, per-syscall breakdowns, and a scrolling
+event tail.
+.PP
+It is designed to be piped from
+.BR sentinel-loader (1)
+running in JSON audit mode. The dashboard refreshes once per second and
+supports all event types: ALLOW, BLOCK, CFI-FAIL, NR-MISMATCH,
+FORK-TRACK, and FEXIT.
+.SH OPTIONS
+.TP
+.BR \-\-help ", " \-h
+Show usage information and exit.
+.TP
+.BR \-\-version ", " \-v
+Print version string and exit.
+.SH DISPLAY SECTIONS
+.TP
+.B Counters
+Aggregate counts for each event type (ALLOW, BLOCK, CFI-OK, CFI-FAIL,
+NR-MISMATCH, FORK, FEXIT) plus total events and events/second.
+.TP
+.B Per-Syscall Breakdown
+Table showing allow/block/fexit counts per syscall number with resolved
+names (write, read, mmap, etc.).
+.TP
+.B Recent Events
+Scrolling tail of the most recent events with color-coded actions:
+green for ALLOW, red for BLOCK/CFI-FAIL, cyan for FORK, yellow for FEXIT.
+.SH EXAMPLES
+.nf
+# Live dashboard for a protected binary
+sudo sentinel-loader --audit --audit-format=json ./victim_phase2 | sentinel-tui
+
+# With fexit return value tracking
+sudo sentinel-loader --audit --fexit --audit-format=json ./myapp | sentinel-tui
+
+# Replay from a log file
+cat audit.jsonl | sentinel-tui
+.fi
+.SH SEE ALSO
+.BR sentinel-loader (1),
+.BR sentinel-dump (1),
+.BR sentinel-sign (1)
+.SH AUTHOR
+Nevin Shine (System Security Student)
+.SH BUGS
+Report bugs at the project repository.

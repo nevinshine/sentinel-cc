@@ -3,7 +3,7 @@
 CLANG ?= clang
 BPFTOOL ?= bpftool
 ARCH ?= $(shell uname -m | sed 's/x86_64/x86/')
-VERSION := 4.1.0
+VERSION := 4.2.0
 
 # --- Directories ---
 SRC_KERNEL  := src/kernel
@@ -13,7 +13,7 @@ SRC_COMMON  := src/common
 TESTS       := tests
 
 # --- Targets ---
-all: victim victim_phase2 victim_cfi victim_threaded victim_fork loader sentinel-dump
+all: victim victim_phase2 victim_cfi victim_threaded victim_fork loader sentinel-dump sentinel-tui
 
 # 0. Prerequisites
 vmlinux.h:
@@ -137,6 +137,10 @@ loader: $(SRC_RUNTIME)/loader.c $(SRC_COMMON)/sentinel_shared.h sentinel.skel.h
 sentinel-dump: $(SRC_RUNTIME)/sentinel_dump.c
 	$(CC) -O2 -Wall -Wextra $(SRC_RUNTIME)/sentinel_dump.c -lelf -o sentinel-dump
 
+# 8. Build TUI Dashboard
+sentinel-tui: $(SRC_RUNTIME)/sentinel_tui.c
+	$(CC) -O2 -Wall -Wextra $(SRC_RUNTIME)/sentinel_tui.c -o sentinel-tui
+
 # --- Execution ---
 run: all
 	sudo ./loader ./victim
@@ -192,7 +196,8 @@ help:
 	@echo "  install-keys   Load public key into kernel keyring (requires sudo)"
 	@echo "  keys           Generate Ed25519 keypair"
 	@echo "  sentinel-dump  Build the policy inspector tool"
-	@echo "  install        Install loader + sign_tool + sentinel-dump system-wide"
+	@echo "  sentinel-tui   Build the terminal dashboard"
+	@echo "  install        Install loader + sign_tool + sentinel-dump + sentinel-tui system-wide"
 	@echo "  install-man    Install man pages to /usr/local/share/man/man1"
 	@echo "  install-systemd  Install systemd template service unit"
 	@echo "  key-rotate     Generate new keypair, re-sign binaries, revoke old key"
@@ -204,10 +209,11 @@ help:
 PREFIX ?= /usr/local
 SYSCONFDIR ?= /etc/sentinel
 
-install: loader sign_tool sentinel-dump
+install: loader sign_tool sentinel-dump sentinel-tui
 	install -D -m 755 loader $(DESTDIR)$(PREFIX)/bin/sentinel-loader
 	install -D -m 755 sign_tool $(DESTDIR)$(PREFIX)/bin/sentinel-sign
 	install -D -m 755 sentinel-dump $(DESTDIR)$(PREFIX)/bin/sentinel-dump
+	install -D -m 755 sentinel-tui $(DESTDIR)$(PREFIX)/bin/sentinel-tui
 	install -d $(DESTDIR)$(SYSCONFDIR)
 	@if [ -f pub.pem ]; then \
 		install -m 644 pub.pem $(DESTDIR)$(SYSCONFDIR)/pub.pem; \
@@ -222,6 +228,7 @@ uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/sentinel-loader
 	rm -f $(DESTDIR)$(PREFIX)/bin/sentinel-sign
 	rm -f $(DESTDIR)$(PREFIX)/bin/sentinel-dump
+	rm -f $(DESTDIR)$(PREFIX)/bin/sentinel-tui
 	rm -f $(DESTDIR)/etc/systemd/system/sentinel@.service
 	@echo "[Uninstall] Removed from $(DESTDIR)$(PREFIX)/bin/"
 
@@ -230,6 +237,7 @@ install-man:
 	install -m 644 man/sentinel-loader.1 $(DESTDIR)$(PREFIX)/share/man/man1/
 	install -m 644 man/sentinel-sign.1 $(DESTDIR)$(PREFIX)/share/man/man1/
 	install -m 644 man/sentinel-dump.1 $(DESTDIR)$(PREFIX)/share/man/man1/
+	install -m 644 man/sentinel-tui.1 $(DESTDIR)$(PREFIX)/share/man/man1/
 	@echo "[Install] Man pages installed to $(DESTDIR)$(PREFIX)/share/man/man1/"
 
 # --- Key Rotation ---
@@ -255,7 +263,7 @@ key-rotate: key-revoke
 	@echo "[KeyRotate] Key rotation complete."
 
 clean:
-	rm -f victim victim_phase2 victim_cfi victim_threaded victim_fork loader sign_tool sentinel-dump
+	rm -f victim victim_phase2 victim_cfi victim_threaded victim_fork loader sign_tool sentinel-dump sentinel-tui
 	rm -f sentinel.bpf.o sentinel.skel.h priv.pem pub.pem vmlinux.h
 	rm -f victim_tampered victim_bench
 	rm -f $(ATTACK_BINS)

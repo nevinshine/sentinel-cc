@@ -22,6 +22,7 @@
 
 // --- Global config (set by loader) ---
 volatile const __u32 audit_mode = 0; // 0 = fast path, 1 = verbose audit
+volatile const __u32 fexit_mode = 0; // 0 = disabled, 1 = post-syscall audit
 
 // --- Maps ---
 
@@ -343,6 +344,54 @@ int BPF_PROG(sentinel_seccomp_check) {
 // --- Fork Tracking ---
 // Automatically enroll child processes when a monitored parent forks/clones.
 // This prevents fork-and-escape attacks where a child runs unmonitored.
+
+// --- fexit Hooks: Post-Syscall Audit ---
+// When fexit_mode is enabled, these hooks emit the syscall return value
+// after the kernel completes the syscall. Useful for observability: see
+// which syscalls succeed/fail without affecting enforcement.
+
+static __always_inline void fexit_audit(u32 syscall_nr, long ret) {
+  if (!fexit_mode)
+    return;
+  u64 pid_tgid = bpf_get_current_pid_tgid();
+  u32 tgid = pid_tgid >> 32;
+  u32 *target = bpf_map_lookup_elem(&target_pid_map, &tgid);
+  if (!target)
+    return;
+  u32 tid = (u32)pid_tgid;
+  // Encode return value in the offset field for compact transport
+  emit_audit(tgid, tid, 0, (u64)ret, 0, syscall_nr, EVENT_FEXIT_OK);
+}
+
+SEC("fexit/__x64_sys_write")
+int BPF_PROG(sentinel_write_exit, struct pt_regs *regs, long ret) {
+  fexit_audit(1, ret);
+  return 0;
+}
+
+SEC("fexit/__x64_sys_read")
+int BPF_PROG(sentinel_read_exit, struct pt_regs *regs, long ret) {
+  fexit_audit(0, ret);
+  return 0;
+}
+
+SEC("fexit/__x64_sys_openat")
+int BPF_PROG(sentinel_openat_exit, struct pt_regs *regs, long ret) {
+  fexit_audit(257, ret);
+  return 0;
+}
+
+SEC("fexit/__x64_sys_mmap")
+int BPF_PROG(sentinel_mmap_exit, struct pt_regs *regs, long ret) {
+  fexit_audit(9, ret);
+  return 0;
+}
+
+SEC("fexit/__x64_sys_connect")
+int BPF_PROG(sentinel_connect_exit, struct pt_regs *regs, long ret) {
+  fexit_audit(42, ret);
+  return 0;
+}
 
 SEC("tp_btf/sched_process_fork")
 int BPF_PROG(sentinel_fork_track, struct task_struct *parent,

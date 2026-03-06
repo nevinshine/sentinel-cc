@@ -45,6 +45,7 @@ src/
 └── runtime/            # Host Tools
     ├── loader.c        # Sig verify, call-graph analysis, BPF loader
     ├── sentinel_dump.c # Policy inspector (reads .sentinel* sections)
+    ├── sentinel_tui.c  # Terminal dashboard (live event visualization)
     └── sign_tool.c     # Ed25519 Signing Utility
 tests/
 ├── victim.c            # Phase 1 test (inline syscalls)
@@ -72,10 +73,11 @@ docs/
 man/
 ├── sentinel-loader.1   # Man page for the runtime loader
 ├── sentinel-sign.1     # Man page for the signing tool
-└── sentinel-dump.1     # Man page for the policy inspector
+├── sentinel-dump.1     # Man page for the policy inspector
+└── sentinel-tui.1      # Man page for the terminal dashboard
 etc/
 └── sentinel@.service   # systemd template unit for protecting binaries
-Makefile                # Build system (25+ targets)
+Makefile                # Build system (30+ targets)
 benchmark.sh            # Syscall latency + attack surface benchmark
 ```
 
@@ -244,6 +246,44 @@ sudo systemctl start sentinel@-usr-local-bin-myserver
 
 Events go to both the journal and syslog for unified log management.
 
+### Post-Syscall Auditing (`--fexit`) (v4.2.0)
+
+fexit BPF hooks emit the return value after the kernel completes key syscalls (write, read, openat, mmap, connect):
+
+```bash
+sudo ./loader --audit --fexit --audit-format=json ./victim_phase2
+```
+
+```json
+{"ts":"2026-03-06T10:00:01.123Z","action":"FEXIT","pid":1234,"tid":1234,"syscall_nr":1,"ret":42}
+```
+
+Useful for observability without affecting enforcement.
+
+### Policy Hot-Reload (`SIGHUP`) (v4.2.0)
+
+Send SIGHUP to the loader to re-read the binary's `.sentinel` section and update BPF maps in-place — no child restart needed:
+
+```bash
+kill -HUP $(pidof sentinel-loader)
+```
+
+### LD_PRELOAD Sanitization (v4.2.0)
+
+The loader detects and strips `LD_PRELOAD`, `LD_LIBRARY_PATH`, and `LD_AUDIT` from the child's environment before `fexecve()`. A warning is printed if any are detected.
+
+### Terminal Dashboard (`sentinel-tui`) (v4.2.0)
+
+Live TUI with aggregate counters, per-syscall breakdown, and color-coded event tail:
+
+```bash
+sudo ./loader --audit --audit-format=json ./victim_phase2 | ./sentinel-tui
+```
+
+### Multi-Arch CI (v4.2.0)
+
+The CI pipeline now includes a Tier 3 ARM64 cross-compilation check that verifies the LLVM pass and BPF target work with `aarch64-linux-gnu`.
+
 ### Per-App Libc Filtering (Call-Graph Analysis)
 
 The flagship v4.0.0 feature. Instead of whitelisting **all** ~435 syscall sites in glibc, Sentinel-CC now whitelists only those *reachable* from the binary's actual library calls.
@@ -361,12 +401,13 @@ sudo ./loader --audit ./victim      # Any test with audit output
 ## Project Status
 
 > [!TIP]
-> **Current Status: v4.1.0 — JSON Audit, Syslog, Policy Inspector, Systemd**
+> **Current Status: v4.2.0 — fexit Hooks, Hot-Reload, TUI Dashboard, LD_PRELOAD Defense**
 > * **Phase 1:** Static Binary Enforcement with Cryptographic Binding.
 > * **Phase 2:** Full Real-World Runtime Security (ASLR, Shared Libs, CFI, Multithreading).
 > * **Phase 3:** Syscall Number Binding + Fork Tracking + Ed25519 Migration.
 > * **v4.0.0:** Per-app call-graph libc filtering (**81.6% attack surface reduction** measured), generalized CFI from `.sentinel_cfi`, obfuscated syscall detection, 16 hook points, key rotation/revocation, system-wide install.
 > * **v4.1.0:** JSON audit format with ISO-8601 timestamps, syslog integration (LOG_DAEMON), `sentinel-dump` policy inspector (text + JSON), systemd template service unit, man pages for all tools.
+> * **v4.2.0:** fexit post-syscall hooks (5 return-value probes), SIGHUP policy hot-reload, LD_PRELOAD/LD_AUDIT/LD_LIBRARY_PATH sanitization, `sentinel-tui` terminal dashboard, ARM64 cross-compilation CI tier.
 > * **Performance:** 274 ns/syscall overhead (48.58%) — within wire-speed threshold.
 > * **Security:** 12/12 red-team attacks blocked + fork tracking. 3 unconditional-block hooks (ptrace, process_vm_writev, seccomp).
 > 

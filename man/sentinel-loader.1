@@ -1,4 +1,4 @@
-.TH SENTINEL-LOADER 1 "March 2026" "Sentinel-CC v4.1.0" "User Commands"
+.TH SENTINEL-LOADER 1 "March 2026" "Sentinel-CC v4.2.0" "User Commands"
 .SH NAME
 sentinel-loader \- Sentinel-CC runtime policy enforcer
 .SH SYNOPSIS
@@ -42,6 +42,24 @@ JSON output includes ISO-8601 timestamps and is suitable for log aggregation pip
 Set the audit output destination. Valid values: \fBstdout\fR (default) or \fBsyslog\fR.
 When syslog is selected, events are sent to the system log (facility LOG_DAEMON)
 with BLOCK/CFI_FAIL/NR_MISMATCH at LOG_WARNING and ALLOW events at LOG_INFO.
+.TP
+.BR \-\-fexit
+Enable post-syscall return value auditing via fexit BPF hooks. Implies \-\-audit.
+Emits FEXIT events showing the return value of key syscalls (write, read, openat,
+mmap, connect) after the kernel completes them.
+.SH SIGNALS
+.TP
+.B SIGHUP
+Triggers a policy hot-reload. The loader re-reads the binary's .sentinel section
+and updates BPF maps in-place without restarting the child process.
+.TP
+.B SIGINT, SIGTERM
+Graceful shutdown: kills child, destroys BPF programs, exits.
+.SH SECURITY
+The loader sanitizes dangerous environment variables before executing the child
+process. The following variables are removed from the child's environment:
+\fBLD_PRELOAD\fR, \fBLD_LIBRARY_PATH\fR, \fBLD_AUDIT\fR.
+A warning is printed if any of these are detected.
 .SH PREREQUISITES
 .TP
 .B Root access

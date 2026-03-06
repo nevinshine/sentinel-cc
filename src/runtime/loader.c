@@ -54,6 +54,7 @@ enum audit_target { AUDIT_TGT_STDOUT = 0, AUDIT_TGT_SYSLOG = 1 };
 static struct sentinel_bpf *g_skel = NULL;
 static pid_t g_child = -1;
 static volatile sig_atomic_t g_shutdown = 0;
+static volatile sig_atomic_t g_reload = 0;
 static enum audit_format g_audit_fmt = AUDIT_FMT_TEXT;
 static enum audit_target g_audit_tgt = AUDIT_TGT_STDOUT;
 
@@ -74,12 +75,21 @@ static void signal_handler(int sig) {
   _exit(128 + sig);
 }
 
+static void sighup_handler(int sig) {
+  (void)sig;
+  g_reload = 1;
+}
+
 static void install_signal_handlers(void) {
   struct sigaction sa = {.sa_handler = signal_handler, .sa_flags = 0};
   sigemptyset(&sa.sa_mask);
   sigaction(SIGINT, &sa, NULL);
   sigaction(SIGTERM, &sa, NULL);
-  sigaction(SIGHUP, &sa, NULL);
+
+  // SIGHUP triggers policy hot-reload instead of shutdown
+  struct sigaction sa_hup = {.sa_handler = sighup_handler, .sa_flags = 0};
+  sigemptyset(&sa_hup.sa_mask);
+  sigaction(SIGHUP, &sa_hup, NULL);
 }
 
 // =============================================================================
@@ -1263,6 +1273,7 @@ static const char *action_str(uint8_t action) {
   case EVENT_CFI_FAIL:    return "CFI-FAIL";
   case EVENT_NR_MISMATCH: return "NR-MISMATCH";
   case EVENT_FORK_TRACK:  return "FORK-TRACK";
+  case EVENT_FEXIT_OK:    return "FEXIT";
   default:                return "UNKNOWN";
   }
 }
@@ -1284,14 +1295,25 @@ static int audit_event_handler(void *ctx, void *data, size_t data_sz) {
     strftime(tbuf, sizeof(tbuf), "%Y-%m-%dT%H:%M:%S", &tm);
 
     char json[512];
-    int n = snprintf(json, sizeof(json),
-      "{\"ts\":\"%s.%03ldZ\",\"action\":\"%s\","
-      "\"pid\":%u,\"tid\":%u,\"syscall_nr\":%u,"
-      "\"rip\":\"0x%lx\",\"offset\":\"0x%lx\",\"module\":%u}",
-      tbuf, ts.tv_nsec / 1000000, action,
-      evt->tgid, evt->tid, evt->syscall_nr,
-      (unsigned long)evt->syscall_rip, (unsigned long)evt->offset,
-      evt->module_id);
+    int n;
+    if (evt->action == EVENT_FEXIT_OK) {
+      n = snprintf(json, sizeof(json),
+        "{\"ts\":\"%s.%03ldZ\",\"action\":\"%s\","
+        "\"pid\":%u,\"tid\":%u,\"syscall_nr\":%u,"
+        "\"ret\":%ld}",
+        tbuf, ts.tv_nsec / 1000000, action,
+        evt->tgid, evt->tid, evt->syscall_nr,
+        (long)evt->offset);
+    } else {
+      n = snprintf(json, sizeof(json),
+        "{\"ts\":\"%s.%03ldZ\",\"action\":\"%s\","
+        "\"pid\":%u,\"tid\":%u,\"syscall_nr\":%u,"
+        "\"rip\":\"0x%lx\",\"offset\":\"0x%lx\",\"module\":%u}",
+        tbuf, ts.tv_nsec / 1000000, action,
+        evt->tgid, evt->tid, evt->syscall_nr,
+        (unsigned long)evt->syscall_rip, (unsigned long)evt->offset,
+        evt->module_id);
+    }
     if (n < 0 || (size_t)n >= sizeof(json))
       return 0;
 
@@ -1305,7 +1327,16 @@ static int audit_event_handler(void *ctx, void *data, size_t data_sz) {
     }
   } else {
     // Original text format
-    if (g_audit_tgt == AUDIT_TGT_SYSLOG) {
+    if (evt->action == EVENT_FEXIT_OK) {
+      if (g_audit_tgt == AUDIT_TGT_SYSLOG)
+        syslog(LOG_INFO, "%s PID=%u TID=%u SYS=%u RET=%ld",
+               action, evt->tgid, evt->tid, evt->syscall_nr,
+               (long)evt->offset);
+      else
+        printf("[Audit] %s PID=%u TID=%u SYS=%u RET=%ld\n",
+               action, evt->tgid, evt->tid, evt->syscall_nr,
+               (long)evt->offset);
+    } else if (g_audit_tgt == AUDIT_TGT_SYSLOG) {
       int prio = (evt->action == EVENT_BLOCK || evt->action == EVENT_CFI_FAIL
                   || evt->action == EVENT_NR_MISMATCH)
                  ? LOG_WARNING : LOG_INFO;
@@ -1333,6 +1364,7 @@ static void print_usage(const char *prog) {
   printf("  --help                Show this help message\n");
   printf("  --version             Show version\n");
   printf("  --audit               Enable real-time audit event printing\n");
+  printf("  --fexit               Enable post-syscall return value auditing\n");
   printf("  --audit-format=FMT    Output format: text (default), json\n");
   printf("  --audit-target=TGT    Output target: stdout (default), syslog\n");
   printf("\nExample:\n");
@@ -1351,6 +1383,7 @@ int main(int argc, char **argv) {
 
   // --- Parse CLI arguments ---
   int audit_mode = 0;
+  int fexit_mode = 0;
   int arg_start = 1;
 
   for (int i = 1; i < argc; i++) {
@@ -1364,6 +1397,12 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[i], "--audit") == 0) {
       audit_mode = 1;
+      arg_start = i + 1;
+      continue;
+    }
+    if (strcmp(argv[i], "--fexit") == 0) {
+      fexit_mode = 1;
+      audit_mode = 1; // fexit implies audit
       arg_start = i + 1;
       continue;
     }
@@ -1440,6 +1479,7 @@ int main(int argc, char **argv) {
     return 1;
   }
   g_skel->rodata->audit_mode = audit_mode ? 1 : 0;
+  g_skel->rodata->fexit_mode = fexit_mode ? 1 : 0;
   if (sentinel_bpf__load(g_skel)) {
     fprintf(stderr, "[FATAL] Failed to load BPF programs.\n");
     sentinel_bpf__destroy(g_skel);
@@ -1465,6 +1505,19 @@ int main(int argc, char **argv) {
 
   printf("[Loader] Launching '%s' with Ptrace synchronization...\n", binary);
 
+  // --- LD_PRELOAD / LD_AUDIT detection ---
+  {
+    const char *lp = getenv("LD_PRELOAD");
+    const char *la = getenv("LD_AUDIT");
+    const char *ll = getenv("LD_LIBRARY_PATH");
+    if (lp && lp[0])
+      fprintf(stderr, "[WARN] LD_PRELOAD detected: %s (will be sanitized)\n", lp);
+    if (la && la[0])
+      fprintf(stderr, "[WARN] LD_AUDIT detected: %s (will be sanitized)\n", la);
+    if (ll && ll[0])
+      fprintf(stderr, "[WARN] LD_LIBRARY_PATH detected: %s (will be sanitized)\n", ll);
+  }
+
   // --- 5. Start Victim with Ptrace ---
   g_child = fork();
   if (g_child < 0) {
@@ -1474,6 +1527,10 @@ int main(int argc, char **argv) {
   }
 
   if (g_child == 0) {
+    // Sanitize dangerous environment variables before exec
+    unsetenv("LD_PRELOAD");
+    unsetenv("LD_LIBRARY_PATH");
+    unsetenv("LD_AUDIT");
     ptrace(PTRACE_TRACEME, 0, NULL, NULL);
     fexecve(verified_fd, &argv[arg_start], environ);
     perror("[Child] fexecve");
@@ -2094,6 +2151,38 @@ libc_ld_whitelist:
   if (rb) {
     // Poll audit events while child runs
     while (!g_shutdown) {
+      // Check for SIGHUP-triggered policy hot-reload
+      if (g_reload) {
+        g_reload = 0;
+        printf("[Loader] SIGHUP received — hot-reloading policy from '%s'...\n",
+               binary);
+        uint64_t reload_offsets[MAX_POLICY_ENTRIES];
+        int64_t reload_nrs[MAX_POLICY_ENTRIES];
+        uint64_t reload_text = 0, reload_base = 0;
+        int reload_count = parse_sentinel_section(
+            binary, reload_offsets, reload_nrs, MAX_POLICY_ENTRIES,
+            &reload_text, &reload_base);
+        if (reload_count > 0) {
+          int reloaded = 0;
+          for (int i = 0; i < reload_count; i++) {
+            uint64_t off = reload_offsets[i] - reload_base;
+            int64_t nr = reload_nrs[i];
+            uint64_t val;
+            if (nr >= 0)
+              val = POLICY_FLAG_CHECK_NR | (uint64_t)(uint32_t)nr;
+            else
+              val = 1;
+            if (bpf_map_update_elem(main_map_fd, &off, &val, BPF_ANY) == 0)
+              reloaded++;
+          }
+          printf("[Loader] Hot-reload complete: %d/%d policy entries updated.\n",
+                 reloaded, reload_count);
+        } else {
+          fprintf(stderr, "[WARN] Hot-reload failed to parse policy (count=%d)\n",
+                  reload_count);
+        }
+      }
+
       int wret = waitpid(g_child, &status, WNOHANG);
       if (wret > 0) {
         if (WIFEXITED(status)) {

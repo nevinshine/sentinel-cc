@@ -27,7 +27,7 @@
 #endif
 
 // --- Version ---
-#define SENTINEL_VERSION "4.1.0"
+#define SENTINEL_VERSION "4.2.0"
 
 // --- Module IDs ---
 #define MODULE_MAIN         1
@@ -41,6 +41,7 @@
 #define EVENT_CFI_FAIL    3
 #define EVENT_NR_MISMATCH 4
 #define EVENT_FORK_TRACK  5  // Child auto-enrolled via sched_process_fork
+#define EVENT_FEXIT_OK   6  // Post-syscall return audit (fexit)
 
 // --- Phase 3: Policy value encoding ---
 // Bit 32 = validate syscall number; bits 0-31 = expected syscall number

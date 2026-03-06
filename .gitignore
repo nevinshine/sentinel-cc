@@ -15,6 +15,7 @@
 /loader
 /sign_tool
 /sentinel-dump
+/sentinel-tui
 /attack_*
 
 # BPF compiled output
