@@ -1,0 +1,106 @@
+.TH SCC 1 "2026-03-06" "Sentinel-CC 4.2.0" "Sentinel-CC Manual"
+.SH NAME
+scc \- unified command-line interface for Sentinel-CC
+.SH SYNOPSIS
+.B scc
+.I command
+.RI [ options ]
+.RI [ args... ]
+.SH DESCRIPTION
+.B scc
+is a git-style CLI that provides a single entry point to the entire
+Sentinel-CC toolchain: compiling, signing, running, benchmarking,
+testing, and monitoring protected binaries.
+.SH COMMANDS
+.TP
+.B build \fIsource.c\fR [\fB\-o\fR \fIoutput\fR]
+Compile a C source file with the SentinelPass LLVM plugin, then
+sign the resulting binary with Ed25519.
+Additional compiler flags can be passed directly.
+.TP
+.B sign \fIbinary\fR
+Sign an already-instrumented binary with Ed25519.
+Requires \fIpriv.pem\fR in the project directory.
+.TP
+.B run \fR[\fIloader-opts\fR] \fIbinary\fR [\fIargs...\fR]
+Run a binary under Sentinel-CC eBPF protection.
+All options are forwarded to the loader (e.g. \fB\-\-audit\fR,
+\fB\-\-fexit\fR, \fB\-\-kill\fR).
+Requires root.
+.TP
+.B ui \fR[\fIloader-opts\fR] \fIbinary\fR [\fIargs...\fR]
+Run a binary under Sentinel protection and pipe audit output to
+the live TUI dashboard.
+Equivalent to: sentinel-loader --audit --audit-format=json ... | sentinel-tui.
+Requires root.
+.TP
+.B bench \fR[\fIbinary\fR] [\fB\-n\fR \fIiterations\fR]
+Run the latency benchmark. Compares native vs Sentinel-enforced
+syscall latency and reports overhead in ns/syscall.
+Defaults to \fIvictim_bench\fR if no binary is specified.
+Requires root.
+.TP
+.B test
+Run the full automated test suite (ELF integrity, signature
+verification, tamper detection, all enforcement phases).
+Requires root.
+.TP
+.B dump \fIbinary\fR
+Inspect the embedded Sentinel policy of a binary.
+Wraps \fBsentinel-dump\fR(1).
+.TP
+.B features
+Display the full feature matrix of the current Sentinel-CC build.
+.TP
+.B status
+Check system readiness: kernel version, BTF availability, required
+tools, keys, and built binaries.
+.TP
+.B version
+Print version and exit.
+.TP
+.B help
+Show usage information.
+.SH EXAMPLES
+.nf
+# Build and protect a program
+scc build myapp.c -o myapp
+scc run ./myapp
+
+# Live monitoring with TUI dashboard
+sudo scc ui ./myapp
+
+# Run benchmarks
+sudo scc bench
+
+# Check system readiness
+scc status
+
+# View all features
+scc features
+
+# Inspect policy
+scc dump ./myapp
+.fi
+.SH ENVIRONMENT
+.B scc
+looks for Sentinel-CC tools first in the project directory (development
+mode), then in
+.IR PATH
+(installed mode).
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Error (missing tool, bad arguments, runtime failure).
+.SH SEE ALSO
+.BR sentinel-loader (1),
+.BR sentinel-sign (1),
+.BR sentinel-dump (1),
+.BR sentinel-tui (1)
+.SH AUTHOR
+Nevin Shine
+.SH BUGS
+Report bugs at https://github.com/nevinshine/sentinel-cc/issues

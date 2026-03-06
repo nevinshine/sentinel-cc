@@ -12,8 +12,11 @@ SRC_COMPILER:= src/compiler
 SRC_COMMON  := src/common
 TESTS       := tests
 
+# --- Directories ---
+SRC_CLI     := src/cli
+
 # --- Targets ---
-all: victim victim_phase2 victim_cfi victim_threaded victim_fork loader sentinel-dump sentinel-tui
+all: victim victim_phase2 victim_cfi victim_threaded victim_fork loader sentinel-dump sentinel-tui scc
 
 # 0. Prerequisites
 vmlinux.h:
@@ -141,6 +144,11 @@ sentinel-dump: $(SRC_RUNTIME)/sentinel_dump.c
 sentinel-tui: $(SRC_RUNTIME)/sentinel_tui.c
 	$(CC) -O2 -Wall -Wextra $(SRC_RUNTIME)/sentinel_tui.c -o sentinel-tui
 
+# 9. Install scc CLI
+scc: $(SRC_CLI)/scc.sh
+	cp $(SRC_CLI)/scc.sh scc
+	chmod +x scc
+
 # --- Execution ---
 run: all
 	sudo ./loader ./victim
@@ -197,7 +205,8 @@ help:
 	@echo "  keys           Generate Ed25519 keypair"
 	@echo "  sentinel-dump  Build the policy inspector tool"
 	@echo "  sentinel-tui   Build the terminal dashboard"
-	@echo "  install        Install loader + sign_tool + sentinel-dump + sentinel-tui system-wide"
+	@echo "  scc            Build the unified CLI tool"
+	@echo "  install        Install all tools system-wide (loader, sign, dump, tui, scc)"
 	@echo "  install-man    Install man pages to /usr/local/share/man/man1"
 	@echo "  install-systemd  Install systemd template service unit"
 	@echo "  key-rotate     Generate new keypair, re-sign binaries, revoke old key"
@@ -209,11 +218,12 @@ help:
 PREFIX ?= /usr/local
 SYSCONFDIR ?= /etc/sentinel
 
-install: loader sign_tool sentinel-dump sentinel-tui
+install: loader sign_tool sentinel-dump sentinel-tui scc
 	install -D -m 755 loader $(DESTDIR)$(PREFIX)/bin/sentinel-loader
 	install -D -m 755 sign_tool $(DESTDIR)$(PREFIX)/bin/sentinel-sign
 	install -D -m 755 sentinel-dump $(DESTDIR)$(PREFIX)/bin/sentinel-dump
 	install -D -m 755 sentinel-tui $(DESTDIR)$(PREFIX)/bin/sentinel-tui
+	install -D -m 755 scc $(DESTDIR)$(PREFIX)/bin/scc
 	install -d $(DESTDIR)$(SYSCONFDIR)
 	@if [ -f pub.pem ]; then \
 		install -m 644 pub.pem $(DESTDIR)$(SYSCONFDIR)/pub.pem; \
@@ -229,6 +239,7 @@ uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/sentinel-sign
 	rm -f $(DESTDIR)$(PREFIX)/bin/sentinel-dump
 	rm -f $(DESTDIR)$(PREFIX)/bin/sentinel-tui
+	rm -f $(DESTDIR)$(PREFIX)/bin/scc
 	rm -f $(DESTDIR)/etc/systemd/system/sentinel@.service
 	@echo "[Uninstall] Removed from $(DESTDIR)$(PREFIX)/bin/"
 
@@ -238,6 +249,7 @@ install-man:
 	install -m 644 man/sentinel-sign.1 $(DESTDIR)$(PREFIX)/share/man/man1/
 	install -m 644 man/sentinel-dump.1 $(DESTDIR)$(PREFIX)/share/man/man1/
 	install -m 644 man/sentinel-tui.1 $(DESTDIR)$(PREFIX)/share/man/man1/
+	install -m 644 man/scc.1 $(DESTDIR)$(PREFIX)/share/man/man1/
 	@echo "[Install] Man pages installed to $(DESTDIR)$(PREFIX)/share/man/man1/"
 
 # --- Key Rotation ---
@@ -263,10 +275,10 @@ key-rotate: key-revoke
 	@echo "[KeyRotate] Key rotation complete."
 
 clean:
-	rm -f victim victim_phase2 victim_cfi victim_threaded victim_fork loader sign_tool sentinel-dump sentinel-tui
+	rm -f victim victim_phase2 victim_cfi victim_threaded victim_fork loader sign_tool sentinel-dump sentinel-tui scc
 	rm -f sentinel.bpf.o sentinel.skel.h priv.pem pub.pem vmlinux.h
 	rm -f victim_tampered victim_bench
 	rm -f $(ATTACK_BINS)
 	rm -rf $(SRC_COMPILER)/build
 
-.PHONY: all attacks bench run run-audit run-phase2 run-cfi run-threaded run-fork test red-team keys install-keys install install-man install-systemd uninstall key-rotate key-revoke clean help version
+.PHONY: all attacks bench run run-audit run-phase2 run-cfi run-threaded run-fork test red-team keys install-keys install install-man install-systemd uninstall key-rotate key-revoke clean help version scc

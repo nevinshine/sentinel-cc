@@ -16,6 +16,7 @@
 /sign_tool
 /sentinel-dump
 /sentinel-tui
+/scc
 /attack_*
 
 # BPF compiled output

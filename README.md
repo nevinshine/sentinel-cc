@@ -47,6 +47,8 @@ src/
     ├── sentinel_dump.c # Policy inspector (reads .sentinel* sections)
     ├── sentinel_tui.c  # Terminal dashboard (live event visualization)
     └── sign_tool.c     # Ed25519 Signing Utility
+src/cli/
+└── scc.sh              # Unified CLI (git-style command interface)
 tests/
 ├── victim.c            # Phase 1 test (inline syscalls)
 ├── victim_phase2.c     # Phase 2 test (shared library / ASLR)
@@ -74,7 +76,8 @@ man/
 ├── sentinel-loader.1   # Man page for the runtime loader
 ├── sentinel-sign.1     # Man page for the signing tool
 ├── sentinel-dump.1     # Man page for the policy inspector
-└── sentinel-tui.1      # Man page for the terminal dashboard
+├── sentinel-tui.1      # Man page for the terminal dashboard
+└── scc.1               # Man page for the unified CLI
 etc/
 └── sentinel@.service   # systemd template unit for protecting binaries
 Makefile                # Build system (30+ targets)
@@ -93,7 +96,23 @@ benchmark.sh            # Syscall latency + attack surface benchmark
 > 
 > 
 
-### 1. Build the System
+### Quick Start with `scc`
+
+The `scc` unified CLI provides a git-style interface to the entire toolchain:
+
+```bash
+make                        # Build everything
+scc status                  # Check system readiness
+scc build tests/victim.c -o victim   # Compile + instrument + sign
+sudo scc run ./victim       # Run under eBPF protection
+sudo scc ui ./victim_phase2 # Live TUI dashboard
+sudo scc bench              # Run latency benchmarks
+sudo scc test               # Full test suite
+scc features                # Show all features
+scc dump ./victim           # Inspect embedded policy
+```
+
+### Manual Build & Run
 
 ```bash
 make clean && make
