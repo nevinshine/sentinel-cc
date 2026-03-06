@@ -1,4 +1,4 @@
-.TH SENTINEL-LOADER 1 "March 2026" "Sentinel-CC v4.0.0" "User Commands"
+.TH SENTINEL-LOADER 1 "March 2026" "Sentinel-CC v4.1.0" "User Commands"
 .SH NAME
 sentinel-loader \- Sentinel-CC runtime policy enforcer
 .SH SYNOPSIS
@@ -33,6 +33,15 @@ Enable real-time audit event printing. Without this flag, only BLOCK
 events are logged via bpf_printk (visible in /sys/kernel/debug/tracing/trace_pipe).
 With \-\-audit, all events (ALLOW, BLOCK, CFI_OK, CFI_FAIL, NR_MISMATCH,
 FORK_TRACK) are streamed to stdout via the BPF ring buffer.
+.TP
+.BR \-\-audit\-format= \fIFMT\fR
+Set the audit output format. Valid values: \fBtext\fR (default) or \fBjson\fR.
+JSON output includes ISO-8601 timestamps and is suitable for log aggregation pipelines.
+.TP
+.BR \-\-audit\-target= \fITGT\fR
+Set the audit output destination. Valid values: \fBstdout\fR (default) or \fBsyslog\fR.
+When syslog is selected, events are sent to the system log (facility LOG_DAEMON)
+with BLOCK/CFI_FAIL/NR_MISMATCH at LOG_WARNING and ALLOW events at LOG_INFO.
 .SH PREREQUISITES
 .TP
 .B Root access
@@ -101,11 +110,15 @@ sudo sentinel-loader ./victim
 # With audit output
 sudo sentinel-loader --audit ./victim_phase2
 
+# JSON audit format to syslog
+sudo sentinel-loader --audit --audit-format=json --audit-target=syslog ./victim_phase2
+
 # Pass arguments to the binary
 sudo sentinel-loader ./myapp --config /etc/myapp.conf
 .fi
 .SH SEE ALSO
 .BR sentinel-sign (1),
+.BR sentinel-dump (1),
 .BR keyctl (1),
 .BR bpftool (8)
 .SH AUTHOR

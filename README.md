@@ -44,6 +44,7 @@ src/
 │   └── sentinel.bpf.c
 └── runtime/            # Host Tools
     ├── loader.c        # Sig verify, call-graph analysis, BPF loader
+    ├── sentinel_dump.c # Policy inspector (reads .sentinel* sections)
     └── sign_tool.c     # Ed25519 Signing Utility
 tests/
 ├── victim.c            # Phase 1 test (inline syscalls)
@@ -70,8 +71,11 @@ docs/
 └── api-reference.md    # Section formats, BPF maps, CLI reference
 man/
 ├── sentinel-loader.1   # Man page for the runtime loader
-└── sentinel-sign.1     # Man page for the signing tool
-Makefile                # Build system (25 targets)
+├── sentinel-sign.1     # Man page for the signing tool
+└── sentinel-dump.1     # Man page for the policy inspector
+etc/
+└── sentinel@.service   # systemd template unit for protecting binaries
+Makefile                # Build system (25+ targets)
 benchmark.sh            # Syscall latency + attack surface benchmark
 ```
 
@@ -174,6 +178,72 @@ The eBPF enforcer hooks **16 security-sensitive syscalls** + 1 tracepoint (17 to
 
 A 256KB ring buffer streams structured events (`audit_event`) to userspace in real-time. Each event contains: timestamp, PID, TID, syscall number, RIP, offset, module ID, and action (ALLOW/BLOCK/CFI_OK/CFI_FAIL).
 
+#### JSON Audit Format (v4.1.0)
+
+The loader supports JSON-formatted audit output with ISO-8601 timestamps, suitable for log aggregation pipelines:
+
+```bash
+sudo ./loader --audit --audit-format=json ./victim_phase2
+```
+
+```json
+{"time":"2026-03-15T14:30:22.123456789Z","action":"ALLOW","pid":1234,"tid":1234,"syscall_nr":1,"rip":"0x4014f0","offset":"0x4f0","module":1}
+```
+
+#### Syslog Integration (v4.1.0)
+
+Route enforcement events directly to the system log for centralized monitoring:
+
+```bash
+sudo ./loader --audit --audit-target=syslog ./victim_phase2
+sudo ./loader --audit --audit-format=json --audit-target=syslog ./victim_phase2
+```
+
+Events are sent to LOG_DAEMON facility: BLOCK/CFI_FAIL/NR_MISMATCH at LOG_WARNING, ALLOW events at LOG_INFO.
+
+### Policy Inspector (`sentinel-dump`)
+
+Inspect the embedded Sentinel sections of any instrumented binary:
+
+```bash
+./sentinel-dump victim_phase2
+```
+
+```text
+── .sentinel (Syscall Policy) ─────────────────────────────────
+  Index  Site Address       Function           Offset     Syscall
+  [  0]  0x00000000004004b7 0x00000000004004b0 0x000000f7 (any)
+  [  1]  0x00000000004004c2 0x00000000004004b0 0x00000102 write (1)
+  ...
+  Total: 6 syscall site(s)
+
+── .sentinel_imports (External Functions) ─────────────────────
+  fclose              fopen               fprintf             printf
+  Total: 6 import(s) (41 bytes)
+
+── .signature ──────────────────────────────────────────────────
+  Size: 64 bytes (Ed25519)
+  Status: SIGNED
+```
+
+JSON output for tooling integration:
+
+```bash
+./sentinel-dump --json victim_phase2 | jq '.sentinel | length'
+```
+
+### Systemd Integration (v4.1.0)
+
+A template service unit enables `systemctl`-managed binary protection:
+
+```bash
+sudo make install-systemd
+sudo systemctl enable sentinel@-usr-local-bin-myserver
+sudo systemctl start sentinel@-usr-local-bin-myserver
+```
+
+Events go to both the journal and syslog for unified log management.
+
 ### Per-App Libc Filtering (Call-Graph Analysis)
 
 The flagship v4.0.0 feature. Instead of whitelisting **all** ~435 syscall sites in glibc, Sentinel-CC now whitelists only those *reachable* from the binary's actual library calls.
@@ -226,9 +296,11 @@ make key-revoke    # Revoke current key only (adds fingerprint to revocation lis
 ### System-Wide Installation
 
 ```bash
-sudo make install      # Installs sentinel-loader, sentinel-sign to /usr/local/bin
-                       # Installs pub.pem to /etc/sentinel/
-sudo make uninstall    # Removes installed files
+sudo make install          # Installs sentinel-loader, sentinel-sign, sentinel-dump to /usr/local/bin
+                           # Installs pub.pem to /etc/sentinel/
+sudo make install-systemd  # Installs systemd template service unit
+sudo make install-man      # Installs man pages
+sudo make uninstall        # Removes installed files
 ```
 
 ### Dynamic `.sentinel` Parsing
@@ -289,11 +361,12 @@ sudo ./loader --audit ./victim      # Any test with audit output
 ## Project Status
 
 > [!TIP]
-> **Current Status: v4.0.0 — Per-App Libc Filtering + Generalized CFI**
+> **Current Status: v4.1.0 — JSON Audit, Syslog, Policy Inspector, Systemd**
 > * **Phase 1:** Static Binary Enforcement with Cryptographic Binding.
 > * **Phase 2:** Full Real-World Runtime Security (ASLR, Shared Libs, CFI, Multithreading).
 > * **Phase 3:** Syscall Number Binding + Fork Tracking + Ed25519 Migration.
 > * **v4.0.0:** Per-app call-graph libc filtering (**81.6% attack surface reduction** measured), generalized CFI from `.sentinel_cfi`, obfuscated syscall detection, 16 hook points, key rotation/revocation, system-wide install.
+> * **v4.1.0:** JSON audit format with ISO-8601 timestamps, syslog integration (LOG_DAEMON), `sentinel-dump` policy inspector (text + JSON), systemd template service unit, man pages for all tools.
 > * **Performance:** 274 ns/syscall overhead (48.58%) — within wire-speed threshold.
 > * **Security:** 12/12 red-team attacks blocked + fork tracking. 3 unconditional-block hooks (ptrace, process_vm_writev, seccomp).
 > 

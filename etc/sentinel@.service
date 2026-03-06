@@ -1,0 +1,48 @@
+# Sentinel-CC systemd Template Unit
+#
+# Protects a binary using Sentinel-CC's eBPF enforcement.
+#
+# Usage:
+#   sudo systemctl enable sentinel@myapp
+#   sudo systemctl start  sentinel@myapp
+#
+# The instance name (%i) is the absolute path to the protected binary,
+# with slashes escaped as dashes (systemd convention).
+#
+# Example:
+#   sudo systemctl start sentinel@-usr-local-bin-myserver
+#   → runs: sentinel-loader --audit --audit-format=json --audit-target=syslog /usr/local/bin/myserver
+#
+# Keys must be installed before starting:
+#   sudo sentinel-sign <binary> /etc/sentinel/priv.pem
+#   sudo keyctl add user sentinel:pubkey "$(cat /etc/sentinel/pub.pem)" @s
+
+[Unit]
+Description=Sentinel-CC eBPF Protection for %I
+Documentation=man:sentinel-loader(1)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sentinel-loader --audit --audit-format=json --audit-target=syslog %I
+Restart=on-failure
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=no
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/sys/fs/bpf /sys/kernel/debug
+
+# BPF requires elevated privileges
+AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_SYS_PTRACE
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_SYS_PTRACE
+
+# Logging — stdout/stderr go to journal; syslog is also used directly
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sentinel-%i
+
+[Install]
+WantedBy=multi-user.target

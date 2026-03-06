@@ -14,6 +14,7 @@
 /victim_tampered
 /loader
 /sign_tool
+/sentinel-dump
 /attack_*
 
 # BPF compiled output

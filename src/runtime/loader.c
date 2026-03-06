@@ -22,9 +22,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <syslog.h>
 #include <sys/ptrace.h>
 #include <sys/user.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 extern char **environ;
@@ -44,10 +46,16 @@ struct sentinel_policy_entry {
   int64_t  syscall_nr;  // Phase 3: encoded syscall number (0=any, >0 = nr+1)
 };
 
+// --- Audit output format ---
+enum audit_format { AUDIT_FMT_TEXT = 0, AUDIT_FMT_JSON = 1 };
+enum audit_target { AUDIT_TGT_STDOUT = 0, AUDIT_TGT_SYSLOG = 1 };
+
 // --- Global state for signal handler cleanup ---
 static struct sentinel_bpf *g_skel = NULL;
 static pid_t g_child = -1;
 static volatile sig_atomic_t g_shutdown = 0;
+static enum audit_format g_audit_fmt = AUDIT_FMT_TEXT;
+static enum audit_target g_audit_tgt = AUDIT_TGT_STDOUT;
 
 // =============================================================================
 // Signal Handler — graceful cleanup
@@ -1264,10 +1272,54 @@ static int audit_event_handler(void *ctx, void *data, size_t data_sz) {
   if (data_sz < sizeof(struct audit_event))
     return 0;
   struct audit_event *evt = data;
-  printf("[Audit] %s PID=%u TID=%u SYS=%u RIP=0x%lx Off=0x%lx Mod=%u\n",
-         action_str(evt->action), evt->tgid, evt->tid, evt->syscall_nr,
-         (unsigned long)evt->syscall_rip, (unsigned long)evt->offset,
-         evt->module_id);
+  const char *action = action_str(evt->action);
+
+  if (g_audit_fmt == AUDIT_FMT_JSON) {
+    // ISO-8601 timestamp from monotonic ns (approximate wall clock)
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tm;
+    gmtime_r(&ts.tv_sec, &tm);
+    char tbuf[32];
+    strftime(tbuf, sizeof(tbuf), "%Y-%m-%dT%H:%M:%S", &tm);
+
+    char json[512];
+    int n = snprintf(json, sizeof(json),
+      "{\"ts\":\"%s.%03ldZ\",\"action\":\"%s\","
+      "\"pid\":%u,\"tid\":%u,\"syscall_nr\":%u,"
+      "\"rip\":\"0x%lx\",\"offset\":\"0x%lx\",\"module\":%u}",
+      tbuf, ts.tv_nsec / 1000000, action,
+      evt->tgid, evt->tid, evt->syscall_nr,
+      (unsigned long)evt->syscall_rip, (unsigned long)evt->offset,
+      evt->module_id);
+    if (n < 0 || (size_t)n >= sizeof(json))
+      return 0;
+
+    if (g_audit_tgt == AUDIT_TGT_SYSLOG) {
+      int prio = (evt->action == EVENT_BLOCK || evt->action == EVENT_CFI_FAIL
+                  || evt->action == EVENT_NR_MISMATCH)
+                 ? LOG_WARNING : LOG_INFO;
+      syslog(prio, "%s", json);
+    } else {
+      printf("%s\n", json);
+    }
+  } else {
+    // Original text format
+    if (g_audit_tgt == AUDIT_TGT_SYSLOG) {
+      int prio = (evt->action == EVENT_BLOCK || evt->action == EVENT_CFI_FAIL
+                  || evt->action == EVENT_NR_MISMATCH)
+                 ? LOG_WARNING : LOG_INFO;
+      syslog(prio, "%s PID=%u TID=%u SYS=%u RIP=0x%lx Off=0x%lx Mod=%u",
+             action, evt->tgid, evt->tid, evt->syscall_nr,
+             (unsigned long)evt->syscall_rip, (unsigned long)evt->offset,
+             evt->module_id);
+    } else {
+      printf("[Audit] %s PID=%u TID=%u SYS=%u RIP=0x%lx Off=0x%lx Mod=%u\n",
+             action, evt->tgid, evt->tid, evt->syscall_nr,
+             (unsigned long)evt->syscall_rip, (unsigned long)evt->offset,
+             evt->module_id);
+    }
+  }
   return 0;
 }
 
@@ -1278,12 +1330,16 @@ static void print_usage(const char *prog) {
   printf("Sentinel-CC Loader v%s\n\n", SENTINEL_VERSION);
   printf("Usage: %s [options] <binary> [args...]\n\n", prog);
   printf("Options:\n");
-  printf("  --help       Show this help message\n");
-  printf("  --version    Show version\n");
-  printf("  --audit      Enable real-time audit event printing\n");
+  printf("  --help                Show this help message\n");
+  printf("  --version             Show version\n");
+  printf("  --audit               Enable real-time audit event printing\n");
+  printf("  --audit-format=FMT    Output format: text (default), json\n");
+  printf("  --audit-target=TGT    Output target: stdout (default), syslog\n");
   printf("\nExample:\n");
   printf("  sudo %s ./victim\n", prog);
   printf("  sudo %s --audit ./victim_phase2\n", prog);
+  printf("  sudo %s --audit --audit-format=json ./victim_phase2\n", prog);
+  printf("  sudo %s --audit --audit-format=json --audit-target=syslog ./app\n", prog);
 }
 
 // =============================================================================
@@ -1311,6 +1367,26 @@ int main(int argc, char **argv) {
       arg_start = i + 1;
       continue;
     }
+    if (strcmp(argv[i], "--audit-format=json") == 0) {
+      g_audit_fmt = AUDIT_FMT_JSON;
+      arg_start = i + 1;
+      continue;
+    }
+    if (strcmp(argv[i], "--audit-format=text") == 0) {
+      g_audit_fmt = AUDIT_FMT_TEXT;
+      arg_start = i + 1;
+      continue;
+    }
+    if (strcmp(argv[i], "--audit-target=syslog") == 0) {
+      g_audit_tgt = AUDIT_TGT_SYSLOG;
+      arg_start = i + 1;
+      continue;
+    }
+    if (strcmp(argv[i], "--audit-target=stdout") == 0) {
+      g_audit_tgt = AUDIT_TGT_STDOUT;
+      arg_start = i + 1;
+      continue;
+    }
     // First non-flag argument is the binary
     arg_start = i;
     break;
@@ -1320,6 +1396,10 @@ int main(int argc, char **argv) {
     fprintf(stderr, "[FATAL] No binary specified. Use --help for usage.\n");
     return 1;
   }
+
+  // Open syslog if requested
+  if (g_audit_tgt == AUDIT_TGT_SYSLOG)
+    openlog("sentinel", LOG_PID | LOG_NDELAY, LOG_DAEMON);
 
   const char *binary = argv[arg_start];
 
@@ -2046,6 +2126,8 @@ cleanup:
     sentinel_bpf__destroy(g_skel);
     g_skel = NULL;
   }
+  if (g_audit_tgt == AUDIT_TGT_SYSLOG)
+    closelog();
   printf("[Loader] Cleanup complete.\n");
   return 0;
 }

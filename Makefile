@@ -3,7 +3,7 @@
 CLANG ?= clang
 BPFTOOL ?= bpftool
 ARCH ?= $(shell uname -m | sed 's/x86_64/x86/')
-VERSION := 4.0.0
+VERSION := 4.1.0
 
 # --- Directories ---
 SRC_KERNEL  := src/kernel
@@ -13,7 +13,7 @@ SRC_COMMON  := src/common
 TESTS       := tests
 
 # --- Targets ---
-all: victim victim_phase2 victim_cfi victim_threaded victim_fork loader
+all: victim victim_phase2 victim_cfi victim_threaded victim_fork loader sentinel-dump
 
 # 0. Prerequisites
 vmlinux.h:
@@ -133,6 +133,10 @@ sentinel.skel.h: sentinel.bpf.o
 loader: $(SRC_RUNTIME)/loader.c $(SRC_COMMON)/sentinel_shared.h sentinel.skel.h
 	$(CLANG) -g -O2 -Wall -Wextra -I. $(SRC_RUNTIME)/loader.c -lbpf -lelf -lcrypto -lkeyutils -o loader
 
+# 7. Build Policy Inspector
+sentinel-dump: $(SRC_RUNTIME)/sentinel_dump.c
+	$(CC) -O2 -Wall -Wextra $(SRC_RUNTIME)/sentinel_dump.c -lelf -o sentinel-dump
+
 # --- Execution ---
 run: all
 	sudo ./loader ./victim
@@ -187,8 +191,10 @@ help:
 	@echo "  bench          Run latency benchmark (requires sudo)"
 	@echo "  install-keys   Load public key into kernel keyring (requires sudo)"
 	@echo "  keys           Generate Ed25519 keypair"
-	@echo "  install        Install loader + sign_tool system-wide"
+	@echo "  sentinel-dump  Build the policy inspector tool"
+	@echo "  install        Install loader + sign_tool + sentinel-dump system-wide"
 	@echo "  install-man    Install man pages to /usr/local/share/man/man1"
+	@echo "  install-systemd  Install systemd template service unit"
 	@echo "  key-rotate     Generate new keypair, re-sign binaries, revoke old key"
 	@echo "  key-revoke     Add current key fingerprint to revocation list"
 	@echo "  clean          Remove all build artifacts"
@@ -198,24 +204,32 @@ help:
 PREFIX ?= /usr/local
 SYSCONFDIR ?= /etc/sentinel
 
-install: loader sign_tool
+install: loader sign_tool sentinel-dump
 	install -D -m 755 loader $(DESTDIR)$(PREFIX)/bin/sentinel-loader
 	install -D -m 755 sign_tool $(DESTDIR)$(PREFIX)/bin/sentinel-sign
+	install -D -m 755 sentinel-dump $(DESTDIR)$(PREFIX)/bin/sentinel-dump
 	install -d $(DESTDIR)$(SYSCONFDIR)
 	@if [ -f pub.pem ]; then \
 		install -m 644 pub.pem $(DESTDIR)$(SYSCONFDIR)/pub.pem; \
 	fi
 	@echo "[Install] Installed to $(DESTDIR)$(PREFIX)/bin/"
 
+install-systemd:
+	install -D -m 644 etc/sentinel@.service $(DESTDIR)/etc/systemd/system/sentinel@.service
+	@echo "[Install] Systemd template installed. Enable with: systemctl enable sentinel@<binary>"
+
 uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/sentinel-loader
 	rm -f $(DESTDIR)$(PREFIX)/bin/sentinel-sign
+	rm -f $(DESTDIR)$(PREFIX)/bin/sentinel-dump
+	rm -f $(DESTDIR)/etc/systemd/system/sentinel@.service
 	@echo "[Uninstall] Removed from $(DESTDIR)$(PREFIX)/bin/"
 
 install-man:
 	install -d $(DESTDIR)$(PREFIX)/share/man/man1
 	install -m 644 man/sentinel-loader.1 $(DESTDIR)$(PREFIX)/share/man/man1/
 	install -m 644 man/sentinel-sign.1 $(DESTDIR)$(PREFIX)/share/man/man1/
+	install -m 644 man/sentinel-dump.1 $(DESTDIR)$(PREFIX)/share/man/man1/
 	@echo "[Install] Man pages installed to $(DESTDIR)$(PREFIX)/share/man/man1/"
 
 # --- Key Rotation ---
@@ -241,10 +255,10 @@ key-rotate: key-revoke
 	@echo "[KeyRotate] Key rotation complete."
 
 clean:
-	rm -f victim victim_phase2 victim_cfi victim_threaded victim_fork loader sign_tool
+	rm -f victim victim_phase2 victim_cfi victim_threaded victim_fork loader sign_tool sentinel-dump
 	rm -f sentinel.bpf.o sentinel.skel.h priv.pem pub.pem vmlinux.h
 	rm -f victim_tampered victim_bench
 	rm -f $(ATTACK_BINS)
 	rm -rf $(SRC_COMPILER)/build
 
-.PHONY: all attacks bench run run-audit run-phase2 run-cfi run-threaded run-fork test red-team keys install-keys install install-man uninstall key-rotate key-revoke clean help version
+.PHONY: all attacks bench run run-audit run-phase2 run-cfi run-threaded run-fork test red-team keys install-keys install install-man install-systemd uninstall key-rotate key-revoke clean help version

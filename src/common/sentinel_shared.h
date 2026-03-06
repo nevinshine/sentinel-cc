@@ -27,7 +27,7 @@
 #endif
 
 // --- Version ---
-#define SENTINEL_VERSION "4.0.0"
+#define SENTINEL_VERSION "4.1.0"
 
 // --- Module IDs ---
 #define MODULE_MAIN         1
