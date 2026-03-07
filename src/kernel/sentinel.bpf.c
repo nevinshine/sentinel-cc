@@ -24,6 +24,9 @@
 volatile const __u32 audit_mode = 0; // 0 = fast path, 1 = verbose audit
 volatile const __u32 fexit_mode = 0; // 0 = disabled, 1 = post-syscall audit
 volatile const __u32 enforce_mode = 0; // 0 = KILL, 1 = PERMISSIVE, 2 = TERM
+volatile const __u32 learn_mode = 0;   // 0 = enforce, 1 = learning (record all)
+volatile const __u32 shadow_cfi = 0;   // 0 = disabled, 1 = shadow stack CFI
+volatile const __u32 system_wide = 0;  // 0 = per-binary, 1 = all processes
 
 // --- Maps ---
 
@@ -87,6 +90,39 @@ struct {
   __type(value, u32); // 1 = enforce
 } cgroup_map SEC(".maps");
 
+// 8. Per-Thread Policy Override ({tgid, tid} → policy index override)
+// When populated, restricts a specific thread to a subset of the policy.
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 512);
+  __type(key, struct thread_key);
+  __type(value, u32); // 0 = use default, >0 = alternate policy_registry index
+} thread_policy_map SEC(".maps");
+
+// 9. Learning Mode Map — records observed {offset → (mod_id << 32)|syscall_nr}
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 8192);
+  __type(key, u64);
+  __type(value, u64);
+} learn_map SEC(".maps");
+
+// 10. System-Wide Fallback Policy (NR → allowed)
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 512);
+  __type(key, u32);
+  __type(value, u32);
+} fallback_policy SEC(".maps");
+
+// 11. Allowed Library Hashes (FNV-1a hash of path → 1)
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 256);
+  __type(key, u64);
+  __type(value, u32);
+} lib_allow_map SEC(".maps");
+
 // Global: 0 = cgroup filtering disabled, 1 = only enforce in listed cgroups
 volatile const __u32 cgroup_filter = 0;
 
@@ -134,10 +170,20 @@ static __always_inline int sentinel_check(void *ctx, u32 syscall_nr) {
   u64 pid_tgid = bpf_get_current_pid_tgid();
   u32 tgid = pid_tgid >> 32;
 
-  // Check if TGID is monitored (covers all threads in the process)
+  // System-wide mode: enforce for ALL processes (fallback for unsigned)
+  // Per-binary mode: only enforce for tracked TGIDs
   u32 *target = bpf_map_lookup_elem(&target_pid_map, &tgid);
-  if (!target)
+  if (!target) {
+    if (!system_wide)
+      return 0;
+    // System-wide fallback: check NR against generic allow-list
+    u32 *fallback_ok = bpf_map_lookup_elem(&fallback_policy, &syscall_nr);
+    if (fallback_ok)
+      return 0; // Syscall allowed by fallback policy
+    u32 tid = (u32)pid_tgid;
+    deny_action(tgid, tid, 0, 0, 0, syscall_nr, EVENT_FALLBACK);
     return 0;
+  }
 
   // Container/cgroup scoping: if cgroup_filter is enabled,
   // skip enforcement for processes outside the allowed cgroups
@@ -151,8 +197,6 @@ static __always_inline int sentinel_check(void *ctx, u32 syscall_nr) {
   struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
   struct pt_regs *regs = (struct pt_regs *)bpf_task_pt_regs(task);
   if (!regs) {
-    // pt_regs unavailable — cannot validate syscall origin.
-    // BLOCK instead of silently allowing: fail-closed.
     u32 tid = (u32)pid_tgid;
     bpf_printk("Sentinel [BLOCK] TID=%d SYS=%d null pt_regs", tid, syscall_nr);
     deny_action(tgid, tid, 0, 0, 0, syscall_nr, EVENT_BLOCK);
@@ -171,6 +215,11 @@ static __always_inline int sentinel_check(void *ctx, u32 syscall_nr) {
   struct vma_value *mod = bpf_map_lookup_elem(&vma_map, &vkey);
 
   if (!mod) {
+    if (learn_mode) {
+      // Learning: record unknown-VMA syscall and allow
+      emit_audit(tgid, tid, syscall_site, 0, 0, syscall_nr, EVENT_LEARN);
+      return 0;
+    }
     bpf_printk("Sentinel [BLOCK] TID=%d SYS=%d Unknown VMA 0x%lx", tid,
                syscall_nr, syscall_site);
     deny_action(tgid, tid, syscall_site, 0, 0, syscall_nr, EVENT_BLOCK);
@@ -180,7 +229,21 @@ static __always_inline int sentinel_check(void *ctx, u32 syscall_nr) {
   // 3. Normalize to module-relative offset
   u64 offset = syscall_site - mod->base_addr;
 
-  // 4. Policy Check via Map-of-Maps
+  // Learning mode: record observed syscall site and allow
+  if (learn_mode) {
+    u64 learn_val = ((u64)mod->module_id << 32) | (u64)syscall_nr;
+    bpf_map_update_elem(&learn_map, &offset, &learn_val, BPF_NOEXIST);
+    emit_audit(tgid, tid, syscall_site, offset, mod->module_id, syscall_nr,
+               EVENT_LEARN);
+    return 0;
+  }
+
+  // 4. Per-Thread Policy Override
+  // Check if this specific thread has a restricted policy set
+  struct thread_key tkey = {.tgid = tgid, .tid = tid};
+  u32 *thread_override = bpf_map_lookup_elem(&thread_policy_map, &tkey);
+
+  // 5. Policy Check via Map-of-Maps
   void *policy_map = bpf_map_lookup_elem(&policy_registry, &mod->module_id);
   if (!policy_map) {
     bpf_printk("Sentinel [BLOCK] TID=%d SYS=%d No Policy Mod=%d", tid,
@@ -199,7 +262,22 @@ static __always_inline int sentinel_check(void *ctx, u32 syscall_nr) {
     return 0;
   }
 
-  // 5. Phase 3: Syscall Number Validation
+  // 5b. Per-Thread NR restriction: if thread has an override, the override
+  // value encodes a bitmask of allowed syscall classes (0 = unrestricted)
+  if (thread_override && *thread_override != 0) {
+    // Thread override value encodes max syscall NR allowed for this thread.
+    // If the syscall NR exceeds the limit, block it.
+    u32 thread_max_nr = *thread_override;
+    if (syscall_nr > thread_max_nr) {
+      bpf_printk("Sentinel [BLOCK] TID=%d SYS=%d exceeds thread limit %d",
+                 tid, syscall_nr, thread_max_nr);
+      deny_action(tgid, tid, syscall_site, offset, mod->module_id, syscall_nr,
+                  EVENT_BLOCK);
+      return 0;
+    }
+  }
+
+  // 6. Phase 3: Syscall Number Validation
   u64 policy_val = *rule;
   if (policy_val & POLICY_FLAG_CHECK_NR) {
     u32 expected_nr = (u32)(policy_val & 0xFFFFFFFF);
@@ -212,7 +290,56 @@ static __always_inline int sentinel_check(void *ctx, u32 syscall_nr) {
     }
   }
 
-  // 6. Deep CFI: Caller Validation (optional, per-site)
+  // 7. Shadow Stack CFI: multi-frame stack walk validation
+  // Validates the ENTIRE return address chain, not just the immediate caller.
+  if (shadow_cfi) {
+    u64 stack[MAX_SHADOW_DEPTH];
+    long sret = bpf_get_stack(ctx, stack, sizeof(stack), BPF_F_USER_STACK);
+    int nframes = sret > 0 ? sret / 8 : 0;
+
+    if (nframes >= 2) {
+      // Validate each return address is within a known VMA
+      int valid = 1;
+      if (nframes > 1) {
+        struct vma_key fk1 = {.prefixlen = 64, .addr = __builtin_bswap64(stack[1])};
+        if (!bpf_map_lookup_elem(&vma_map, &fk1)) valid = 0;
+      }
+      if (valid && nframes > 2) {
+        struct vma_key fk2 = {.prefixlen = 64, .addr = __builtin_bswap64(stack[2])};
+        if (!bpf_map_lookup_elem(&vma_map, &fk2)) valid = 0;
+      }
+      if (valid && nframes > 3) {
+        struct vma_key fk3 = {.prefixlen = 64, .addr = __builtin_bswap64(stack[3])};
+        if (!bpf_map_lookup_elem(&vma_map, &fk3)) valid = 0;
+      }
+      if (valid && nframes > 4) {
+        struct vma_key fk4 = {.prefixlen = 64, .addr = __builtin_bswap64(stack[4])};
+        if (!bpf_map_lookup_elem(&vma_map, &fk4)) valid = 0;
+      }
+      if (valid && nframes > 5) {
+        struct vma_key fk5 = {.prefixlen = 64, .addr = __builtin_bswap64(stack[5])};
+        if (!bpf_map_lookup_elem(&vma_map, &fk5)) valid = 0;
+      }
+      if (valid && nframes > 6) {
+        struct vma_key fk6 = {.prefixlen = 64, .addr = __builtin_bswap64(stack[6])};
+        if (!bpf_map_lookup_elem(&vma_map, &fk6)) valid = 0;
+      }
+      if (valid && nframes > 7) {
+        struct vma_key fk7 = {.prefixlen = 64, .addr = __builtin_bswap64(stack[7])};
+        if (!bpf_map_lookup_elem(&vma_map, &fk7)) valid = 0;
+      }
+      if (!valid) {
+        deny_action(tgid, tid, syscall_site, offset, mod->module_id, syscall_nr,
+                    EVENT_SHADOW_FAIL);
+        return 0;
+      }
+      if (audit_mode)
+        emit_audit(tgid, tid, syscall_site, offset, mod->module_id, syscall_nr,
+                   EVENT_SHADOW_OK);
+    }
+  }
+
+  // 8. Deep CFI: Caller Validation (optional, per-site)
   struct cfi_range *range = bpf_map_lookup_elem(&cfi_policy, &offset);
   if (range) {
     u64 stack[4]; // [0]=current IP, [1]=caller IP
@@ -223,7 +350,6 @@ static __always_inline int sentinel_check(void *ctx, u32 syscall_nr) {
       u64 caller_offset = caller_rip - mod->base_addr;
 
       if (caller_offset >= range->start && caller_offset <= range->end) {
-        // CFI passed — fall through to allow
         if (audit_mode) {
           emit_audit(tgid, tid, syscall_site, offset, mod->module_id,
                      syscall_nr, EVENT_CFI_OK);
@@ -238,8 +364,6 @@ static __always_inline int sentinel_check(void *ctx, u32 syscall_nr) {
         return 0;
       }
     }
-    // Stack walk failed — BLOCK instead of silently allowing.
-    // If we can't verify the caller, assume compromise.
     bpf_printk("Sentinel [CFI-FAIL] TID=%d SYS=%d stack walk failed (ret=%ld)",
                tid, syscall_nr, ret);
     deny_action(tgid, tid, syscall_site, offset, mod->module_id, syscall_nr,

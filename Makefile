@@ -3,7 +3,7 @@
 CLANG ?= clang
 BPFTOOL ?= bpftool
 ARCH ?= $(shell uname -m | sed 's/x86_64/x86/')
-VERSION := 4.3.0
+VERSION := 4.4.0
 
 # --- Directories ---
 SRC_KERNEL  := src/kernel

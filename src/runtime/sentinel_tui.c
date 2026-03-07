@@ -14,7 +14,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define VERSION "4.2.0"
+#define VERSION "4.4.0"
 #define MAX_HISTORY 256
 #define MAX_SYSCALLS 512
 
@@ -67,6 +67,11 @@ static unsigned long total_nr_mismatch = 0;
 static unsigned long total_fork = 0;
 static unsigned long total_fexit = 0;
 static unsigned long total_permissive = 0;
+static unsigned long total_learn = 0;
+static unsigned long total_lib_deny = 0;
+static unsigned long total_shadow_ok = 0;
+static unsigned long total_shadow_fail = 0;
+static unsigned long total_fallback = 0;
 static unsigned long total_events = 0;
 
 static struct tui_event history[MAX_HISTORY];
@@ -205,6 +210,19 @@ static void update_stats(const struct tui_event *evt) {
     total_block++;
   } else if (strcmp(evt->action, "DLOPEN-EXT") == 0) {
     // Informational: library loaded, no counter needed
+  } else if (strcmp(evt->action, "LEARN") == 0) {
+    total_learn++;
+  } else if (strcmp(evt->action, "LIB-DENY") == 0) {
+    total_lib_deny++;
+    total_block++;
+  } else if (strcmp(evt->action, "SHADOW-OK") == 0) {
+    total_shadow_ok++;
+  } else if (strcmp(evt->action, "SHADOW-FAIL") == 0) {
+    total_shadow_fail++;
+    total_block++;
+  } else if (strcmp(evt->action, "FALLBACK") == 0) {
+    total_fallback++;
+    total_block++;
   }
 
   // Add to ring buffer
@@ -277,6 +295,16 @@ static void render(void) {
          total_nr_mismatch, total_fork, total_fexit);
   if (total_permissive > 0)
     printf("  " YELLOW "PERMISSIVE: %lu" RESET, total_permissive);
+  if (total_learn > 0)
+    printf("  " YELLOW "LEARN: %lu" RESET, total_learn);
+  if (total_shadow_ok > 0)
+    printf("  " GREEN "SHADOW-OK: %lu" RESET, total_shadow_ok);
+  if (total_shadow_fail > 0)
+    printf("  " RED "SHADOW-FAIL: %lu" RESET, total_shadow_fail);
+  if (total_lib_deny > 0)
+    printf("  " RED "LIB-DENY: %lu" RESET, total_lib_deny);
+  if (total_fallback > 0)
+    printf("  " RED "FALLBACK: %lu" RESET, total_fallback);
   printf("\n\n");
 
   // Per-syscall breakdown

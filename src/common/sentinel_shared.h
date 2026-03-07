@@ -27,7 +27,7 @@
 #endif
 
 // --- Version ---
-#define SENTINEL_VERSION "4.3.0"
+#define SENTINEL_VERSION "4.4.0"
 
 // --- Module IDs ---
 #define MODULE_MAIN         1
@@ -49,7 +49,14 @@
 #define EVENT_FEXIT_OK    6  // Post-syscall return audit (fexit)
 #define EVENT_DLOPEN_EXT  7  // Runtime dlopen() policy extension
 #define EVENT_PERMISSIVE  8  // Violation logged in permissive mode (not killed)
+#define EVENT_LEARN       9  // Learning mode: observed syscall recorded
+#define EVENT_LIB_DENY   10  // Unauthorized library load denied
+#define EVENT_SHADOW_OK  11  // Shadow stack validation passed
+#define EVENT_SHADOW_FAIL 12 // Shadow stack validation failed
+#define EVENT_FALLBACK   13  // System-wide fallback policy applied
 
+// --- Max constants ---
+#define MAX_SHADOW_DEPTH 8  // Max stack frames for shadow stack CFI
 // --- Phase 3: Policy value encoding ---
 // Bit 32 = validate syscall number; bits 0-31 = expected syscall number
 // If bit 32 is clear, policy value == 1 means "wildcard — allow any nr"
@@ -93,6 +100,24 @@ struct cfi_range {
   S_U64 end;
 };
 
+// --- Thread Policy Key (for per-thread enforcement) ---
+struct thread_key {
+  S_U32 tgid;
+  S_U32 tid;
+};
+
+// --- Kernel Subsystem Mapping ---
+// Maps syscall numbers to kernel subsystem categories for attack surface reports
+#define SUBSYS_PROCESS   0  // fork, execve, exit, prctl
+#define SUBSYS_FILESYSTEM 1 // open, read, write, close, stat
+#define SUBSYS_NETWORK   2  // connect, sendmsg, socket, bind
+#define SUBSYS_MEMORY    3  // mmap, mprotect, brk
+#define SUBSYS_IPC       4  // pipe, shmget, msgget
+#define SUBSYS_SIGNAL    5  // kill, sigaction
+#define SUBSYS_DEVICE    6  // ioctl, read/write on devices
+#define SUBSYS_SECURITY  7  // seccomp, ptrace, keyctl
+#define SUBSYS_OTHER     8
+
 // --- Compile-time struct size assertions ---
 // These catch layout divergence at build time rather than at runtime.
 #ifndef __BPF__
@@ -104,6 +129,8 @@ _Static_assert(sizeof(struct vma_value) == 12,
                "vma_value size mismatch — check padding");
 _Static_assert(sizeof(struct cfi_range) == 16,
                "cfi_range size mismatch");
+_Static_assert(sizeof(struct thread_key) == 8,
+               "thread_key size mismatch");
 #endif
 
 #endif // SENTINEL_SHARED_H
