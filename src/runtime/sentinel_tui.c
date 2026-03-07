@@ -66,6 +66,7 @@ static unsigned long total_cfi_fail = 0;
 static unsigned long total_nr_mismatch = 0;
 static unsigned long total_fork = 0;
 static unsigned long total_fexit = 0;
+static unsigned long total_permissive = 0;
 static unsigned long total_events = 0;
 
 static struct tui_event history[MAX_HISTORY];
@@ -199,6 +200,11 @@ static void update_stats(const struct tui_event *evt) {
     total_fexit++;
     struct syscall_stats *s = get_stats(evt->syscall_nr);
     if (s) s->fexit_count++;
+  } else if (strcmp(evt->action, "PERMISSIVE") == 0) {
+    total_permissive++;
+    total_block++;
+  } else if (strcmp(evt->action, "DLOPEN-EXT") == 0) {
+    // Informational: library loaded, no counter needed
   }
 
   // Add to ring buffer
@@ -266,9 +272,12 @@ static void render(void) {
   printf("    " GREEN "ALLOW: %lu" RESET "  " RED "BLOCK: %lu" RESET
          "  " GREEN "CFI-OK: %lu" RESET "  " RED "CFI-FAIL: %lu" RESET
          "  " RED "NR-MISMATCH: %lu" RESET "  " CYAN "FORK: %lu" RESET
-         "  " YELLOW "FEXIT: %lu" RESET "\n\n",
+         "  " YELLOW "FEXIT: %lu" RESET,
          total_allow, total_block, total_cfi_ok, total_cfi_fail,
          total_nr_mismatch, total_fork, total_fexit);
+  if (total_permissive > 0)
+    printf("  " YELLOW "PERMISSIVE: %lu" RESET, total_permissive);
+  printf("\n\n");
 
   // Per-syscall breakdown
   if (sys_stats_count > 0) {

@@ -6,7 +6,7 @@
 
 set -euo pipefail
 
-VERSION="4.2.0"
+VERSION="4.3.0"
 
 # ── Colors ───────────────────────────────────────────────────────────
 RED=$'\033[0;31m'
@@ -90,11 +90,21 @@ ${BOLD}COMMANDS${NC}
 ${BOLD}EXAMPLES${NC}
   scc build tests/victim.c -o victim
   scc run ./victim
+  scc run --permissive ./victim
+  scc run --enforce=term --watch-dlopen ./victim
+  scc run --cgroup=/sys/fs/cgroup/myapp ./victim
   scc ui --audit ./victim_phase2
   scc bench
   scc test
   scc dump ./victim
   scc features
+
+${BOLD}LOADER OPTIONS${NC} (for run/ui commands)
+  --audit                   Enable audit logging
+  --permissive              Log violations but do not kill
+  --enforce=kill|permissive|term  Set enforcement mode (default: kill)
+  --watch-dlopen            Monitor for dlopen'd libraries at runtime
+  --cgroup=PATH             Restrict enforcement to a cgroup
 
 ${DIM}https://github.com/nevinshine/sentinel-cc${NC}
 EOF

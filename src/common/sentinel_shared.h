@@ -27,12 +27,17 @@
 #endif
 
 // --- Version ---
-#define SENTINEL_VERSION "4.2.0"
+#define SENTINEL_VERSION "4.3.0"
 
 // --- Module IDs ---
 #define MODULE_MAIN         1
 #define MODULE_LIBC         2
 #define MODULE_DYNAMIC_BASE 3  // First dynamically-assigned module ID
+
+// --- Enforcement Mode ---
+#define ENFORCE_KILL       0  // SIGKILL on violation (default, fail-closed)
+#define ENFORCE_PERMISSIVE 1  // Log violation but do not kill (audit-only)
+#define ENFORCE_TERM       2  // SIGTERM on violation (graceful shutdown)
 
 // --- Audit Event Constants ---
 #define EVENT_ALLOW       0
@@ -41,12 +46,19 @@
 #define EVENT_CFI_FAIL    3
 #define EVENT_NR_MISMATCH 4
 #define EVENT_FORK_TRACK  5  // Child auto-enrolled via sched_process_fork
-#define EVENT_FEXIT_OK   6  // Post-syscall return audit (fexit)
+#define EVENT_FEXIT_OK    6  // Post-syscall return audit (fexit)
+#define EVENT_DLOPEN_EXT  7  // Runtime dlopen() policy extension
+#define EVENT_PERMISSIVE  8  // Violation logged in permissive mode (not killed)
 
 // --- Phase 3: Policy value encoding ---
 // Bit 32 = validate syscall number; bits 0-31 = expected syscall number
 // If bit 32 is clear, policy value == 1 means "wildcard — allow any nr"
 #define POLICY_FLAG_CHECK_NR (1ULL << 32)
+
+// --- Policy Format Version ---
+// Magic bytes + version at the start of .sentinel section
+#define SENTINEL_POLICY_MAGIC   0x53454E54U  // "SENT"
+#define SENTINEL_POLICY_VERSION 2            // Format version (v2 adds NR binding)
 
 // --- Audit Event Structure ---
 // Transmitted via BPF ring buffer from kernel to userspace.

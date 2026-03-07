@@ -24,6 +24,7 @@
 #include <string.h>
 #include <syslog.h>
 #include <sys/ptrace.h>
+#include <sys/stat.h>
 #include <sys/user.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -57,6 +58,9 @@ static volatile sig_atomic_t g_shutdown = 0;
 static volatile sig_atomic_t g_reload = 0;
 static enum audit_format g_audit_fmt = AUDIT_FMT_TEXT;
 static enum audit_target g_audit_tgt = AUDIT_TGT_STDOUT;
+static int g_enforce_mode = ENFORCE_KILL; // default: fail-closed
+static int g_watch_dlopen = 0; // 1 = periodically re-scan /proc/maps for new libs
+static char g_cgroup_path[512] = {0}; // cgroup v2 path for container scoping
 
 // =============================================================================
 // Signal Handler — graceful cleanup
@@ -1274,6 +1278,8 @@ static const char *action_str(uint8_t action) {
   case EVENT_NR_MISMATCH: return "NR-MISMATCH";
   case EVENT_FORK_TRACK:  return "FORK-TRACK";
   case EVENT_FEXIT_OK:    return "FEXIT";
+  case EVENT_DLOPEN_EXT:  return "DLOPEN-EXT";
+  case EVENT_PERMISSIVE:  return "PERMISSIVE";
   default:                return "UNKNOWN";
   }
 }
@@ -1355,6 +1361,128 @@ static int audit_event_handler(void *ctx, void *data, size_t data_sz) {
 }
 
 // =============================================================================
+// dlopen() Runtime Monitoring
+// Periodically re-scans /proc/PID/maps for new shared libraries that were
+// loaded at runtime via dlopen(). For each new library, creates a policy map,
+// does a full-text syscall scan, and registers it in the policy_registry.
+// This addresses the limitation where dlopen()-loaded plugins have no policy.
+// =============================================================================
+#define DLOPEN_SCAN_INTERVAL_MS 500  // Check every 500ms
+#define MAX_WATCHED_LIBS 64
+
+struct watched_lib {
+  char path[512];
+  uint32_t module_id;
+};
+
+static struct watched_lib g_watched_libs[MAX_WATCHED_LIBS];
+static int g_n_watched_libs = 0;
+
+static int is_lib_watched(const char *path) {
+  for (int i = 0; i < g_n_watched_libs; i++) {
+    if (strcmp(g_watched_libs[i].path, path) == 0)
+      return 1;
+  }
+  return 0;
+}
+
+static void register_watched_lib(const char *path, uint32_t mod_id) {
+  if (g_n_watched_libs >= MAX_WATCHED_LIBS)
+    return;
+  strncpy(g_watched_libs[g_n_watched_libs].path, path, 511);
+  g_watched_libs[g_n_watched_libs].path[511] = '\0';
+  g_watched_libs[g_n_watched_libs].module_id = mod_id;
+  g_n_watched_libs++;
+}
+
+// Scan /proc/PID/maps for new libraries not yet in our watch list.
+// Returns the number of newly discovered libraries.
+static int dlopen_scan(pid_t pid, int vma_fd, int registry_fd,
+                       uint32_t *next_mod_id, const char *bin_name,
+                       unsigned long libc_base) {
+  char maps_path[64], line[512];
+  snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
+  FILE *fp = fopen(maps_path, "r");
+  if (!fp)
+    return 0;
+
+  int new_libs = 0;
+  while (fgets(line, sizeof(line), fp)) {
+    if (!strstr(line, "r-xp") && !strstr(line, "r--p"))
+      continue;
+    char *path = strchr(line, '/');
+    if (!path)
+      continue;
+    char *nl = strchr(path, '\n');
+    if (nl)
+      *nl = '\0';
+
+    // Skip known modules
+    if (strstr(path, bin_name))
+      continue;
+    if (strstr(path, "/libc.so") || strstr(path, "/libc-"))
+      continue;
+    if (strstr(path, "ld-linux") || strstr(path, "ld-musl"))
+      continue;
+    if (!strstr(path, ".so"))
+      continue;
+    if (strstr(path, "ld.so.cache") || strstr(path, "locale-archive") ||
+        strstr(path, "gconv-modules"))
+      continue;
+
+    // Already tracked?
+    if (is_lib_watched(path))
+      continue;
+
+    // New library discovered! (likely via dlopen)
+    const char *short_name = strrchr(path, '/');
+    short_name = short_name ? short_name + 1 : path;
+
+    if (*next_mod_id >= 64)
+      continue;
+
+    char map_name[16];
+    snprintf(map_name, sizeof(map_name), "dl_pol_%u", *next_mod_id);
+    int lib_map_fd = bpf_map_create(BPF_MAP_TYPE_HASH, map_name,
+                                    sizeof(uint64_t), sizeof(uint64_t),
+                                    4096, NULL);
+    if (lib_map_fd < 0)
+      continue;
+
+    uint32_t mod_id = *next_mod_id;
+    if (bpf_map_update_elem(registry_fd, &mod_id, &lib_map_fd, BPF_ANY) != 0) {
+      close(lib_map_fd);
+      continue;
+    }
+
+    unsigned long lib_base = 0;
+    int lib_blocks = populate_vma_for_module(vma_fd, pid, short_name,
+                                             mod_id, &lib_base);
+
+    // Full-text syscall scan
+    uint64_t sites[512];
+    int nsites = scan_elf_text_for_syscalls(path, sites, 512);
+    int added = 0;
+    for (int j = 0; j < nsites; j++) {
+      uint64_t val = 1; // Wildcard
+      if (bpf_map_update_elem(lib_map_fd, &sites[j], &val, BPF_ANY) == 0)
+        added++;
+    }
+
+    printf("[Loader] dlopen() detected: '%s' (mod=%u, base=0x%lx, "
+           "%d blocks, %d sites)\n",
+           short_name, mod_id, lib_base, lib_blocks, added);
+
+    register_watched_lib(path, mod_id);
+    close(lib_map_fd);
+    (*next_mod_id)++;
+    new_libs++;
+  }
+  fclose(fp);
+  return new_libs;
+}
+
+// =============================================================================
 // CLI
 // =============================================================================
 static void print_usage(const char *prog) {
@@ -1365,12 +1493,20 @@ static void print_usage(const char *prog) {
   printf("  --version             Show version\n");
   printf("  --audit               Enable real-time audit event printing\n");
   printf("  --fexit               Enable post-syscall return value auditing\n");
+  printf("  --permissive          Log violations but do not kill (audit-only)\n");
+  printf("  --enforce=MODE        Enforcement: kill (default), permissive, term\n");
+  printf("  --watch-dlopen        Monitor for dlopen() and extend policy at runtime\n");
+  printf("  --cgroup=PATH         Restrict enforcement to processes in this cgroup v2\n");
   printf("  --audit-format=FMT    Output format: text (default), json\n");
   printf("  --audit-target=TGT    Output target: stdout (default), syslog\n");
+  printf("\nEnforcement Modes:\n");
+  printf("  kill        SIGKILL on violation (default, fail-closed)\n");
+  printf("  permissive  Log violation but allow syscall (for policy development)\n");
+  printf("  term        SIGTERM on violation (allows graceful shutdown handlers)\n");
   printf("\nExample:\n");
   printf("  sudo %s ./victim\n", prog);
-  printf("  sudo %s --audit ./victim_phase2\n", prog);
-  printf("  sudo %s --audit --audit-format=json ./victim_phase2\n", prog);
+  printf("  sudo %s --audit --permissive ./victim_phase2\n", prog);
+  printf("  sudo %s --audit --watch-dlopen --enforce=term ./app\n", prog);
   printf("  sudo %s --audit --audit-format=json --audit-target=syslog ./app\n", prog);
 }
 
@@ -1403,6 +1539,37 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "--fexit") == 0) {
       fexit_mode = 1;
       audit_mode = 1; // fexit implies audit
+      arg_start = i + 1;
+      continue;
+    }
+    if (strcmp(argv[i], "--permissive") == 0) {
+      g_enforce_mode = ENFORCE_PERMISSIVE;
+      audit_mode = 1; // permissive implies audit (must see violations)
+      arg_start = i + 1;
+      continue;
+    }
+    if (strcmp(argv[i], "--enforce=kill") == 0) {
+      g_enforce_mode = ENFORCE_KILL;
+      arg_start = i + 1;
+      continue;
+    }
+    if (strcmp(argv[i], "--enforce=permissive") == 0) {
+      g_enforce_mode = ENFORCE_PERMISSIVE;
+      audit_mode = 1;
+      arg_start = i + 1;
+      continue;
+    }
+    if (strcmp(argv[i], "--enforce=term") == 0) {
+      g_enforce_mode = ENFORCE_TERM;
+      arg_start = i + 1;
+      continue;
+    }
+    if (strcmp(argv[i], "--watch-dlopen") == 0) {
+      g_watch_dlopen = 1;
+      arg_start = i + 1;
+      continue;
+    if (strncmp(argv[i], "--cgroup=", 9) == 0) {
+      strncpy(g_cgroup_path, argv[i] + 9, sizeof(g_cgroup_path) - 1);
       arg_start = i + 1;
       continue;
     }
@@ -1475,11 +1642,13 @@ int main(int argc, char **argv) {
   // --- 3. Setup BPF ---
   g_skel = sentinel_bpf__open();
   if (!g_skel) {
+  g_skel->rodata->cgroup_filter = (g_cgroup_path[0] != '\0') ? 1 : 0;
     fprintf(stderr, "[FATAL] Failed to open BPF skeleton.\n");
     return 1;
   }
   g_skel->rodata->audit_mode = audit_mode ? 1 : 0;
   g_skel->rodata->fexit_mode = fexit_mode ? 1 : 0;
+  g_skel->rodata->enforce_mode = g_enforce_mode;
   if (sentinel_bpf__load(g_skel)) {
     fprintf(stderr, "[FATAL] Failed to load BPF programs.\n");
     sentinel_bpf__destroy(g_skel);
@@ -1491,6 +1660,33 @@ int main(int argc, char **argv) {
     return 1;
   }
   printf("[Loader] BPF programs loaded and attached.\n");
+  {
+    const char *mode_str = "kill";
+    if (g_enforce_mode == ENFORCE_PERMISSIVE) mode_str = "permissive";
+    else if (g_enforce_mode == ENFORCE_TERM) mode_str = "term";
+   
+
+  // --- Populate cgroup map if --cgroup specified ---
+  if (g_cgroup_path[0] != '\0') {
+    // Get cgroup ID by stat()ing the cgroup directory
+    struct stat cg_stat;
+    if (stat(g_cgroup_path, &cg_stat) == 0) {
+      uint64_t cgid = (uint64_t)cg_stat.st_ino;
+      uint32_t val = 1;
+      int cg_fd = bpf_map__fd(g_skel->maps.cgroup_map);
+      if (bpf_map_update_elem(cg_fd, &cgid, &val, BPF_ANY) == 0) {
+        printf("[Loader] Cgroup filter: %s (id=%lu)\n",
+               g_cgroup_path, (unsigned long)cgid);
+      } else {
+        fprintf(stderr, "[Warn] Failed to add cgroup ID: %s\n",
+                strerror(errno));
+      }
+    } else {
+      fprintf(stderr, "[Warn] Cannot stat cgroup path '%s': %s\n",
+              g_cgroup_path, strerror(errno));
+    }
+  } printf("[Loader] Enforcement mode: %s\n", mode_str);
+  }
 
   // --- 4. Setup audit ring buffer if requested ---
   struct ring_buffer *rb = NULL;
@@ -2051,6 +2247,9 @@ libc_ld_whitelist:
                "%d/%d syscall sites whitelisted.\n",
                short_name, mod_id, lib_base, lib_blocks, added, nsites);
 
+        // Track for dlopen() change detection
+        register_watched_lib(lib_path, mod_id);
+
         close(lib_map_fd);
         next_mod_id++;
       }
@@ -2059,6 +2258,22 @@ libc_ld_whitelist:
         printf("[Loader] Multi-library: discovered %d additional libraries.\n",
                n_libs);
     }
+  }
+
+  // Save module state for dlopen() runtime scanner
+  uint32_t dlopen_next_mod_id = MODULE_DYNAMIC_BASE;
+  {
+    // Count already-used module IDs from multi-lib discovery
+    // The library block above increments next_mod_id, but it's scoped.
+    // Re-derive: MODULE_DYNAMIC_BASE + n_watched_libs covers it.
+    dlopen_next_mod_id = MODULE_DYNAMIC_BASE + (uint32_t)g_n_watched_libs;
+  }
+
+  // Also register main binary and libc paths so dlopen scanner skips them
+  {
+    char main_full[512];
+    if (realpath(binary, main_full))
+      register_watched_lib(main_full, MODULE_MAIN);
   }
 
   // --- 11. Setup CFI policy ---
@@ -2196,6 +2411,19 @@ libc_ld_whitelist:
         }
       }
       ring_buffer__poll(rb, 100 /* ms */);
+
+      // dlopen() monitoring: periodically check for new libraries
+      if (g_watch_dlopen) {
+        static int dlopen_poll_counter = 0;
+        if (++dlopen_poll_counter >= (DLOPEN_SCAN_INTERVAL_MS / 100)) {
+          dlopen_poll_counter = 0;
+          int new_libs = dlopen_scan(g_child, vma_fd, registry_fd,
+                                     &dlopen_next_mod_id, bin_name, libc_base);
+          if (new_libs > 0)
+            printf("[Loader] dlopen watch: %d new libraries discovered.\n",
+                   new_libs);
+        }
+      }
     }
     ring_buffer__free(rb);
     rb = NULL;
@@ -2219,4 +2447,5 @@ cleanup:
     closelog();
   printf("[Loader] Cleanup complete.\n");
   return 0;
+}
 }

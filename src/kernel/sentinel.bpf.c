@@ -23,6 +23,7 @@
 // --- Global config (set by loader) ---
 volatile const __u32 audit_mode = 0; // 0 = fast path, 1 = verbose audit
 volatile const __u32 fexit_mode = 0; // 0 = disabled, 1 = post-syscall audit
+volatile const __u32 enforce_mode = 0; // 0 = KILL, 1 = PERMISSIVE, 2 = TERM
 
 // --- Maps ---
 
@@ -76,6 +77,19 @@ struct {
   __uint(max_entries, 256 * 1024); // 256KB
 } audit_ringbuf SEC(".maps");
 
+// 7. Cgroup Tracking (cgroup_id → 1)
+// When populated, only processes in these cgroups are enforced.
+// Empty map = enforce all monitored PIDs (default, backward compatible).
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 256);
+  __type(key, u64);   // cgroup ID (from bpf_get_current_cgroup_id())
+  __type(value, u32); // 1 = enforce
+} cgroup_map SEC(".maps");
+
+// Global: 0 = cgroup filtering disabled, 1 = only enforce in listed cgroups
+volatile const __u32 cgroup_filter = 0;
+
 // --- Helpers ---
 
 static __always_inline void emit_audit(u32 tgid, u32 tid, u64 rip,
@@ -96,6 +110,24 @@ static __always_inline void emit_audit(u32 tgid, u32 tid, u64 rip,
   bpf_ringbuf_submit(evt, 0);
 }
 
+// Deny action: kill, log-only (permissive), or terminate
+static __always_inline void deny_action(u32 tgid, u32 tid, u64 rip,
+                                        u64 offset, u32 mod_id,
+                                        u32 syscall_nr, u8 event_type) {
+  if (enforce_mode == ENFORCE_PERMISSIVE) {
+    // Permissive mode: log the violation but do NOT kill
+    emit_audit(tgid, tid, rip, offset, mod_id, syscall_nr, EVENT_PERMISSIVE);
+    bpf_printk("Sentinel [PERMISSIVE] TID=%d SYS=%d Off=0x%lx (would BLOCK)",
+               tid, syscall_nr, offset);
+    return;
+  }
+  emit_audit(tgid, tid, rip, offset, mod_id, syscall_nr, event_type);
+  if (enforce_mode == ENFORCE_TERM)
+    bpf_send_signal(15); // SIGTERM — graceful
+  else
+    bpf_send_signal(9);  // SIGKILL — fail-closed default
+}
+
 // Core enforcement logic — shared by all syscall hooks
 // Hot path (ALLOW) is minimal: 3 map lookups + 1 compare, zero I/O.
 static __always_inline int sentinel_check(void *ctx, u32 syscall_nr) {
@@ -107,6 +139,15 @@ static __always_inline int sentinel_check(void *ctx, u32 syscall_nr) {
   if (!target)
     return 0;
 
+  // Container/cgroup scoping: if cgroup_filter is enabled,
+  // skip enforcement for processes outside the allowed cgroups
+  if (cgroup_filter) {
+    u64 cgid = bpf_get_current_cgroup_id();
+    u32 *cg_allowed = bpf_map_lookup_elem(&cgroup_map, &cgid);
+    if (!cg_allowed)
+      return 0; // Not in an enforced cgroup — skip
+  }
+
   struct task_struct *task = (struct task_struct *)bpf_get_current_task_btf();
   struct pt_regs *regs = (struct pt_regs *)bpf_task_pt_regs(task);
   if (!regs) {
@@ -114,8 +155,7 @@ static __always_inline int sentinel_check(void *ctx, u32 syscall_nr) {
     // BLOCK instead of silently allowing: fail-closed.
     u32 tid = (u32)pid_tgid;
     bpf_printk("Sentinel [BLOCK] TID=%d SYS=%d null pt_regs", tid, syscall_nr);
-    emit_audit(tgid, tid, 0, 0, 0, syscall_nr, EVENT_BLOCK);
-    bpf_send_signal(9);
+    deny_action(tgid, tid, 0, 0, 0, syscall_nr, EVENT_BLOCK);
     return 0;
   }
 
@@ -133,8 +173,7 @@ static __always_inline int sentinel_check(void *ctx, u32 syscall_nr) {
   if (!mod) {
     bpf_printk("Sentinel [BLOCK] TID=%d SYS=%d Unknown VMA 0x%lx", tid,
                syscall_nr, syscall_site);
-    emit_audit(tgid, tid, syscall_site, 0, 0, syscall_nr, EVENT_BLOCK);
-    bpf_send_signal(9);
+    deny_action(tgid, tid, syscall_site, 0, 0, syscall_nr, EVENT_BLOCK);
     return 0;
   }
 
@@ -146,9 +185,8 @@ static __always_inline int sentinel_check(void *ctx, u32 syscall_nr) {
   if (!policy_map) {
     bpf_printk("Sentinel [BLOCK] TID=%d SYS=%d No Policy Mod=%d", tid,
                syscall_nr, mod->module_id);
-    emit_audit(tgid, tid, syscall_site, offset, mod->module_id, syscall_nr,
+    deny_action(tgid, tid, syscall_site, offset, mod->module_id, syscall_nr,
                EVENT_BLOCK);
-    bpf_send_signal(9);
     return 0;
   }
 
@@ -156,9 +194,8 @@ static __always_inline int sentinel_check(void *ctx, u32 syscall_nr) {
   if (!rule) {
     bpf_printk("Sentinel [BLOCK] TID=%d SYS=%d Vio Offset 0x%lx (Mod %d)",
                tid, syscall_nr, offset, mod->module_id);
-    emit_audit(tgid, tid, syscall_site, offset, mod->module_id, syscall_nr,
+    deny_action(tgid, tid, syscall_site, offset, mod->module_id, syscall_nr,
                EVENT_BLOCK);
-    bpf_send_signal(9);
     return 0;
   }
 
@@ -169,9 +206,8 @@ static __always_inline int sentinel_check(void *ctx, u32 syscall_nr) {
     if (expected_nr != syscall_nr) {
       bpf_printk("Sentinel [NR-MISMATCH] TID=%d Got %d Want %d Off 0x%lx",
                  tid, syscall_nr, expected_nr, offset);
-      emit_audit(tgid, tid, syscall_site, offset, mod->module_id, syscall_nr,
-                 EVENT_NR_MISMATCH);
-      bpf_send_signal(9);
+      deny_action(tgid, tid, syscall_site, offset, mod->module_id, syscall_nr,
+                  EVENT_NR_MISMATCH);
       return 0;
     }
   }
@@ -197,9 +233,8 @@ static __always_inline int sentinel_check(void *ctx, u32 syscall_nr) {
         bpf_printk(
             "Sentinel [CFI-FAIL] TID=%d BadCaller 0x%lx (Valid: 0x%lx-0x%lx)",
             tid, caller_offset, range->start, range->end);
-        emit_audit(tgid, tid, syscall_site, offset, mod->module_id, syscall_nr,
-                   EVENT_CFI_FAIL);
-        bpf_send_signal(9);
+        deny_action(tgid, tid, syscall_site, offset, mod->module_id, syscall_nr,
+                    EVENT_CFI_FAIL);
         return 0;
       }
     }
@@ -207,9 +242,8 @@ static __always_inline int sentinel_check(void *ctx, u32 syscall_nr) {
     // If we can't verify the caller, assume compromise.
     bpf_printk("Sentinel [CFI-FAIL] TID=%d SYS=%d stack walk failed (ret=%ld)",
                tid, syscall_nr, ret);
-    emit_audit(tgid, tid, syscall_site, offset, mod->module_id, syscall_nr,
-               EVENT_CFI_FAIL);
-    bpf_send_signal(9);
+    deny_action(tgid, tid, syscall_site, offset, mod->module_id, syscall_nr,
+                EVENT_CFI_FAIL);
     return 0;
   }
 
@@ -271,8 +305,7 @@ int BPF_PROG(sentinel_ptrace_check) {
     return 0;
   u32 tid = (u32)pid_tgid;
   bpf_printk("Sentinel [BLOCK] TID=%d ptrace denied for monitored process", tid);
-  emit_audit(tgid, tid, 0, 0, 0, 101, EVENT_BLOCK);
-  bpf_send_signal(9);
+  deny_action(tgid, tid, 0, 0, 0, 101, EVENT_BLOCK);
   return 0;
 }
 
@@ -294,8 +327,7 @@ int BPF_PROG(sentinel_process_vm_writev_check) {
     return 0;
   u32 tid = (u32)pid_tgid;
   bpf_printk("Sentinel [BLOCK] TID=%d process_vm_writev denied", tid);
-  emit_audit(tgid, tid, 0, 0, 0, 311, EVENT_BLOCK);
-  bpf_send_signal(9);
+  deny_action(tgid, tid, 0, 0, 0, 311, EVENT_BLOCK);
   return 0;
 }
 
@@ -336,8 +368,7 @@ int BPF_PROG(sentinel_seccomp_check) {
     return 0;
   u32 tid = (u32)pid_tgid;
   bpf_printk("Sentinel [BLOCK] TID=%d seccomp denied for monitored process", tid);
-  emit_audit(tgid, tid, 0, 0, 0, 317, EVENT_BLOCK);
-  bpf_send_signal(9);
+  deny_action(tgid, tid, 0, 0, 0, 317, EVENT_BLOCK);
   return 0;
 }
 
