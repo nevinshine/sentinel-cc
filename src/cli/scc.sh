@@ -253,9 +253,9 @@ cmd_bench() {
 
   setup_keyring_silent
 
-  local tmpout
-  tmpout=$(mktemp /tmp/scc_bench.XXXXXX)
-  trap 'rm -f "$tmpout"' EXIT
+  _SCC_TMPOUT=$(mktemp /tmp/scc_bench.XXXXXX)
+  trap 'rm -f "$_SCC_TMPOUT"' EXIT
+  local tmpout="$_SCC_TMPOUT"
 
   echo ""
   echo -e "${BOLD}════════════════════════════════════════════════════════${NC}"
