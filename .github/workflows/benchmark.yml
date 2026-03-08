@@ -36,10 +36,11 @@ jobs:
             if ! bpftool btf dump file /sys/kernel/btf/vmlinux format c > /dev/null 2>&1; then
               echo "Package bpftool cannot dump BTF, building from source..."
               sudo apt-get install -y git libcap-dev 2>/dev/null || true
-              git clone --depth 1 https://github.com/libbpf/bpftool.git /tmp/bpftool
+              git clone --recurse-submodules --depth 1 https://github.com/libbpf/bpftool.git /tmp/bpftool
               cd /tmp/bpftool/src && make -j$(nproc) && sudo cp bpftool /usr/local/bin/
               cd -
               hash -r
+              echo "Source-built bpftool: $(bpftool version 2>&1)"
             fi
           fi
           # wrk
