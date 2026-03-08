@@ -34,6 +34,10 @@ cleanup_servers() {
     kill "$p" 2>/dev/null || true
     kill -9 "$p" 2>/dev/null || true
   done
+  # Kill any leaked background processes so the CI runner can exit cleanly
+  pkill -9 -f './loader --system-wide' 2>/dev/null || true
+  pkill -9 -f 'nginx.*sentinel' 2>/dev/null || true
+  killall -9 redis-server 2>/dev/null || true
 }
 
 trap 'rm -f "$TMPOUT"; cleanup_servers' EXIT
@@ -87,20 +91,19 @@ setup_keyring
 
 # Start BPF hooks in system-wide mode using a long-running instrumented binary
 start_bpf_hooks() {
-  setsid ./loader --system-wide ./victim_phase2 > /dev/null 2>&1 &
+  ./loader --system-wide ./victim_phase2 > /dev/null 2>&1 &
   BPF_LOADER_PID=$!
-  PIDS+=("$BPF_LOADER_PID")
+  disown "$BPF_LOADER_PID"          # detach from job table
   sleep 2  # Let BPF programs attach
 }
 
 stop_bpf_hooks() {
   if [[ -n "${BPF_LOADER_PID:-}" ]]; then
     kill "$BPF_LOADER_PID" 2>/dev/null || true
-    # Don't wait — setsid children can't be waited on reliably
-    sleep 0.5
-    # Ensure it's dead
+    sleep 0.3
     kill -9 "$BPF_LOADER_PID" 2>/dev/null || true
-    PIDS=("${PIDS[@]/$BPF_LOADER_PID/}")
+    # Also kill any leaked loader children
+    pkill -9 -f './loader --system-wide' 2>/dev/null || true
     BPF_LOADER_PID=""
   fi
 }

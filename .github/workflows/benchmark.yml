@@ -132,6 +132,10 @@ jobs:
           chmod +x benchmarks/macro_bench.sh
           sudo systemctl stop nginx redis-server 2>/dev/null || true
           sudo ./benchmarks/macro_bench.sh 5 2>&1
+          # Ensure no orphaned background processes keep the runner alive
+          sudo pkill -9 -f './loader' 2>/dev/null || true
+          sudo pkill -9 -f 'victim_phase2' 2>/dev/null || true
+          sudo killall -9 nginx redis-server 2>/dev/null || true
 
       - name: "Benchmark 3: Comparative Evaluation"
         if: env.BTF_OK == 'true'
@@ -140,6 +144,8 @@ jobs:
         run: |
           chmod +x eval/comparative.sh
           sudo ./eval/comparative.sh 2>&1
+          sudo pkill -9 -f './loader' 2>/dev/null || true
+          sudo pkill -9 -f 'victim' 2>/dev/null || true
 
       - name: "Red Team Attack Suite"
         if: env.BTF_OK == 'true'
