@@ -43,12 +43,12 @@ jobs:
           echo "BTF_OK=$BTF" >> "$GITHUB_ENV"
 
       - name: Build Sentinel-CC
-        run: make -j$(nproc) 2>&1 | tail -20
+        run: make -j$(nproc)
 
       - name: Build benchmarks & attacks
+        timeout-minutes: 10
         run: |
-          make victim_bench 2>&1 | tail -5
-          make attacks 2>&1 | tail -5
+          make -j$(nproc) victim_bench attacks
           clang -fpass-plugin=src/compiler/build/SentinelPass.so -O2 \
             benchmarks/sqlite_bench.c -lsqlite3 -o benchmarks/sqlite_bench
           ./sign_tool benchmarks/sqlite_bench priv.pem
