@@ -11,8 +11,13 @@
 set -u
 
 RUNS=${1:-30}
+MAX_SECONDS=${2:-480}   # Internal watchdog: self-terminate after this many seconds (default 8 min)
 CSV_OUT="benchmarks/results_macro.csv"
 TMPOUT=$(mktemp /tmp/sentinel_macro.XXXXXX)
+
+# Internal watchdog: kill ourselves if we exceed MAX_SECONDS
+( sleep "$MAX_SECONDS"; echo "[WATCHDOG] $MAX_SECONDS seconds elapsed, self-terminating"; kill -TERM $$ 2>/dev/null ) &
+WATCHDOG_PID=$!
 
 BOLD='\033[1m'
 GREEN='\033[0;32m'
@@ -41,7 +46,7 @@ cleanup_servers() {
   killall -9 redis-server 2>/dev/null || true
 }
 
-trap 'rm -f "$TMPOUT"; cleanup_servers' EXIT
+trap 'kill "$WATCHDOG_PID" 2>/dev/null; rm -f "$TMPOUT"; cleanup_servers' EXIT
 trap 'echo "[SIGTERM] cleaning up..."; cleanup_servers; exit 143' TERM INT
 
 setup_keyring() {
