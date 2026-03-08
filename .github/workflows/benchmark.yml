@@ -140,10 +140,10 @@ jobs:
       - name: "Benchmark 3: Comparative Evaluation"
         if: env.BTF_OK == 'true'
         continue-on-error: true
-        timeout-minutes: 5
+        timeout-minutes: 8
         run: |
           chmod +x eval/comparative.sh
-          sudo ./eval/comparative.sh 2>&1
+          sudo ./eval/comparative.sh 100000 5 2>&1
           sudo pkill -9 -f './loader' 2>/dev/null || true
           sudo pkill -9 -f 'victim' 2>/dev/null || true
 

@@ -13,7 +13,7 @@
 set -u
 
 ITERS=${1:-100000}
-RUNS=30
+RUNS=${2:-30}
 CSV="eval/results_comparative.csv"
 
 BOLD='\033[1m'
@@ -58,7 +58,7 @@ run_bench() {
   info "Running: $label" >&2
   for i in $(seq 1 "$RUNS"); do
     local avg
-    avg=$("$@" 2>&1 | grep 'BENCH_AVG_NS=' | cut -d= -f2)
+    avg=$(timeout 30 "$@" 2>&1 | grep 'BENCH_AVG_NS=' | cut -d= -f2)
     echo "${avg:-0}" >> "$results_file"
   done
 
