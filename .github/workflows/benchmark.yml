@@ -126,9 +126,11 @@ jobs:
 
       - name: "Benchmark 2: Macro Benchmarks (nginx/Redis/SQLite)"
         if: env.BTF_OK == 'true'
+        timeout-minutes: 8
         run: |
           chmod +x benchmarks/macro_bench.sh
-          sudo ./benchmarks/macro_bench.sh 10 2>&1
+          sudo systemctl stop nginx redis-server 2>/dev/null || true
+          sudo ./benchmarks/macro_bench.sh 5 2>&1
 
       - name: "Benchmark 3: Comparative Evaluation"
         if: env.BTF_OK == 'true'

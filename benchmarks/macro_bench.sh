@@ -87,7 +87,7 @@ start_bpf_hooks() {
   ./loader --system-wide ./victim_phase2 > /dev/null 2>&1 &
   BPF_LOADER_PID=$!
   PIDS+=("$BPF_LOADER_PID")
-  sleep 1  # Let BPF programs attach
+  sleep 2  # Let BPF programs attach
 }
 
 stop_bpf_hooks() {
@@ -111,14 +111,20 @@ run_nginx_bench() {
   fi
 
   for i in $(seq 1 "$RUNS"); do
+    # Ensure port is free
+    killall nginx 2>/dev/null || true; sleep 0.1
     nginx -c "$(pwd)/benchmarks/nginx_bench.conf" &
     local srv_pid=$!
     PIDS+=("$srv_pid")
-    sleep 0.5
+    # Wait for nginx to actually listen
+    for _w in $(seq 1 10); do
+      if bash -c "echo >/dev/tcp/127.0.0.1/8765" 2>/dev/null; then break; fi
+      sleep 0.2
+    done
 
     # wrk: 1 thread, 8 connections, 2 seconds (laptop-safe)
     local rps
-    rps=$(wrk -t1 -c8 -d2s http://127.0.0.1:8765/ 2>/dev/null | \
+    rps=$(timeout 10 wrk -t1 -c8 -d2s http://127.0.0.1:8765/ 2>/dev/null | \
           grep 'Requests/sec' | awk '{print $2}')
     echo "${rps:-0}" >> "$results_file"
 
@@ -146,16 +152,25 @@ run_nginx_bench() {
 if command -v nginx &>/dev/null && command -v wrk &>/dev/null; then
   info "Benchmark 1: nginx (HTTP throughput)"
 
+  # Stop system nginx to free ports/PIDs
+  systemctl stop nginx 2>/dev/null || true
+  killall nginx 2>/dev/null || true
+
   # Generate minimal nginx config if not present
   if [[ ! -f benchmarks/nginx_bench.conf ]]; then
     cat > benchmarks/nginx_bench.conf <<'NGINX_CONF'
 daemon off;
 worker_processes 1;
 pid /tmp/sentinel_nginx.pid;
-error_log /dev/null;
+error_log /tmp/sentinel_nginx_err.log;
 events { worker_connections 64; }
 http {
   access_log off;
+  client_body_temp_path /tmp/nginx_body;
+  proxy_temp_path /tmp/nginx_proxy;
+  fastcgi_temp_path /tmp/nginx_fastcgi;
+  uwsgi_temp_path /tmp/nginx_uwsgi;
+  scgi_temp_path /tmp/nginx_scgi;
   server {
     listen 8765;
     location / { return 200 "ok\n"; }
@@ -188,14 +203,20 @@ run_redis_bench() {
   fi
 
   for i in $(seq 1 "$RUNS"); do
+    # Ensure port is free
+    killall redis-server 2>/dev/null || true; sleep 0.1
     redis-server --port 7777 --save "" --appendonly no --loglevel warning &
     local srv_pid=$!
     PIDS+=("$srv_pid")
-    sleep 0.5
+    # Wait for redis to actually listen
+    for _w in $(seq 1 10); do
+      if bash -c "echo >/dev/tcp/127.0.0.1/7777" 2>/dev/null; then break; fi
+      sleep 0.2
+    done
 
     # 10k requests, 10 parallel, pipeline 8 (laptop-safe)
     local ops
-    ops=$(redis-benchmark -p 7777 -n 10000 -c 10 -P 8 -q 2>/dev/null | \
+    ops=$(timeout 15 redis-benchmark -p 7777 -n 10000 -c 10 -P 8 -q 2>/dev/null | \
           grep 'SET:' | awk '{print $2}')
     echo "${ops:-0}" >> "$results_file"
 
@@ -221,6 +242,10 @@ run_redis_bench() {
 
 if command -v redis-server &>/dev/null && command -v redis-benchmark &>/dev/null; then
   info "Benchmark 2: Redis (SET throughput)"
+
+  # Stop system redis to free port
+  systemctl stop redis-server 2>/dev/null || true
+  killall redis-server 2>/dev/null || true
   native_redis=$(run_redis_bench native)
   sentinel_redis=$(run_redis_bench sentinel)
   native_mean=$(echo "$native_redis" | awk '{print $1}')
