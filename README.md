@@ -825,4 +825,4 @@ The per-module `inner_policy` hash maps have a default maximum of 4096 entries (
 
 ---
 
-**Sentinel-CC v4.2.0** — @Nevin Shine (System Security Student) 2026
+**Sentinel-CC v4.4.0** — @Nevin Shine (System Security Student) 2026
