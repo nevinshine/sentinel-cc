@@ -1,0 +1,54 @@
+# Sentinel-CC Integration Tests
+# Runs on a self-hosted runner with BTF-enabled kernel.
+# Triggered manually or via repository_dispatch.
+
+name: Integration Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      skip_benchmark:
+        description: 'Skip benchmark step'
+        required: false
+        default: 'false'
+        type: boolean
+  repository_dispatch:
+    types: [run-integration]
+
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  integration:
+    name: Integration Tests (BTF kernel)
+    runs-on: [self-hosted, btf-kernel]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build All
+        run: |
+          make keys
+          make CC=clang sign_tool
+          make CLANG=clang victim victim_phase2 victim_cfi victim_threaded victim_fork
+          make attacks
+          make vmlinux.h
+          make sentinel.skel.h
+          make loader
+
+      - name: Setup Keyring
+        run: |
+          sudo keyctl add user sentinel:pubkey "$(cat pub.pem)" @s > /dev/null 2>&1
+          kid=$(sudo keyctl search @s user sentinel:pubkey 2>/dev/null)
+          sudo keyctl setperm "$kid" 0x3f3f3f3f 2>/dev/null || true
+
+      - name: Run Test Suite
+        run: sudo tests/run_all.sh
+
+      - name: Run Red Team Suite
+        run: sudo tests/red_team.sh
+
+      - name: Run Benchmark
+        if: ${{ github.event.inputs.skip_benchmark != 'true' }}
+        run: sudo ./benchmark.sh

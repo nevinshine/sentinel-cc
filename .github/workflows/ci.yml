@@ -1,6 +1,7 @@
 # Sentinel-CC CI Pipeline
 # Tier 1: Build + static checks (runs on standard runners)
-# Tier 2: Full integration tests (requires self-hosted runner with BTF kernel)
+# Tier 2: Integration tests are in a separate workflow (integration.yml)
+#          triggered manually via workflow_dispatch on self-hosted runners.
 
 name: Sentinel-CC CI
 
@@ -9,6 +10,10 @@ on:
     branches: [ main, develop ]
   pull_request:
     branches: [ main ]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   LLVM_VERSION: 18
@@ -20,6 +25,7 @@ jobs:
   build:
     name: Build & Verify
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -134,7 +140,6 @@ jobs:
             victim_cfi
             victim_threaded
             victim_fork
-            loader
             sign_tool
             attack_*
             pub.pem
@@ -142,57 +147,12 @@ jobs:
           if-no-files-found: warn
 
   # ═══════════════════════════════════════════════════════════════════
-  # Tier 2: Integration Tests (self-hosted runner with BTF kernel)
-  # Requires a self-hosted runner labeled 'btf-kernel'. If no runner
-  # is available, this job will time out after 5 minutes and the
-  # overall workflow will still succeed (continue-on-error: true).
-  # ═══════════════════════════════════════════════════════════════════
-  integration:
-    name: Integration Tests
-    needs: build
-    runs-on: [self-hosted, btf-kernel]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    timeout-minutes: 15
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download Binaries
-        uses: actions/download-artifact@v4
-        with:
-          name: sentinel-binaries
-
-      - name: Make Binaries Executable
-        run: chmod +x victim* loader sign_tool attack_*
-
-      - name: Build BPF (requires BTF)
-        run: |
-          # Need vmlinux.h and bpftool on the runner
-          make vmlinux.h
-          make sentinel.skel.h
-          make loader
-
-      - name: Setup Keyring
-        run: |
-          sudo keyctl add user sentinel:pubkey "$(cat pub.pem)" @s > /dev/null 2>&1
-          kid=$(sudo keyctl search @s user sentinel:pubkey 2>/dev/null)
-          sudo keyctl setperm "$kid" 0x3f3f3f3f 2>/dev/null || true
-
-      - name: Run Test Suite
-        run: sudo tests/run_all.sh
-
-      - name: Run Red Team Suite
-        run: sudo tests/red_team.sh
-
-      - name: Run Benchmark
-        run: sudo ./benchmark.sh
-
-  # ═══════════════════════════════════════════════════════════════════
-  # Tier 3: Multi-Arch Cross-Compilation Check
+  # Tier 2: Multi-Arch Cross-Compilation Check
   # ═══════════════════════════════════════════════════════════════════
   cross-compile:
     name: Cross-Compile (ARM64)
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
