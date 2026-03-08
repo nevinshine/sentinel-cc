@@ -35,13 +35,14 @@ cleanup_servers() {
     kill -9 "$p" 2>/dev/null || true
   done
   # Kill any leaked background processes so the CI runner can exit cleanly
-  pkill -9 -f './loader --system-wide' 2>/dev/null || true
-  pkill -9 -f 'nginx.*sentinel' 2>/dev/null || true
+  pkill -9 -f './loader' 2>/dev/null || true
+  pkill -9 -f 'victim_phase2' 2>/dev/null || true
+  killall -9 nginx 2>/dev/null || true
   killall -9 redis-server 2>/dev/null || true
 }
 
 trap 'rm -f "$TMPOUT"; cleanup_servers' EXIT
-trap '' TERM  # Ignore SIGTERM in main script (let cleanup handle it)
+trap 'echo "[SIGTERM] cleaning up..."; cleanup_servers; exit 143' TERM
 
 setup_keyring() {
   if [ ! -f pub.pem ]; then
@@ -291,7 +292,7 @@ run_sqlite_bench() {
     if [[ "$mode" == "sentinel" ]]; then
       # sqlite_bench is Sentinel-instrumented, run directly under the loader
       local output
-      output=$(./loader ./benchmarks/sqlite_bench "$db_path" 2>&1) || true
+      output=$(timeout 30 ./loader ./benchmarks/sqlite_bench "$db_path" 2>&1) || true
       elapsed=$(echo "$output" | grep 'SQLITE_OPS_PER_SEC=' | cut -d= -f2)
       if [[ -z "$elapsed" || "$elapsed" == "0" ]] && [[ "$i" -eq 1 ]]; then
         warn "loader+sqlite_bench failed, sentinel sqlite benchmark unavailable" >&2
