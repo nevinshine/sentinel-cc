@@ -18,22 +18,29 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm lld libbpf-dev libelf-dev \
+          sudo apt-get install -y clang llvm-dev lld libbpf-dev libelf-dev \
             libssl-dev libkeyutils-dev cmake make \
             nginx redis-server redis-tools libsqlite3-dev libseccomp-dev
-          # bpftool — try kernel-specific, then azure, then generic, then build from source
+          # Detect clang's LLVM major version so pass + compiler stay in sync
+          CLANG_MAJOR=$(clang -dumpversion | cut -d. -f1)
+          echo "Detected clang major version: ${CLANG_MAJOR}"
+          sudo apt-get install -y "llvm-${CLANG_MAJOR}-dev" 2>/dev/null || true
+          echo "LLVM_VER=${CLANG_MAJOR}" >> "$GITHUB_ENV"
+          # bpftool — test actual BTF dump (not just bpftool version which broken wrappers pass)
           KVER=$(uname -r)
           sudo apt-get install -y "linux-tools-${KVER}" 2>/dev/null \
             || sudo apt-get install -y linux-tools-azure 2>/dev/null \
             || sudo apt-get install -y linux-tools-generic 2>/dev/null \
             || true
-          # Verify bpftool actually works (not just a wrapper stub)
-          if ! bpftool version &>/dev/null; then
-            echo "Package bpftool broken, building from kernel source..."
-            sudo apt-get install -y git libelf-dev libcap-dev 2>/dev/null || true
-            git clone --depth 1 https://github.com/libbpf/bpftool.git /tmp/bpftool
-            cd /tmp/bpftool/src && make -j$(nproc) && sudo cp bpftool /usr/local/bin/
-            cd -
+          if [ -f /sys/kernel/btf/vmlinux ]; then
+            if ! bpftool btf dump file /sys/kernel/btf/vmlinux format c > /dev/null 2>&1; then
+              echo "Package bpftool cannot dump BTF, building from source..."
+              sudo apt-get install -y git libcap-dev 2>/dev/null || true
+              git clone --depth 1 https://github.com/libbpf/bpftool.git /tmp/bpftool
+              cd /tmp/bpftool/src && make -j$(nproc) && sudo cp bpftool /usr/local/bin/
+              cd -
+              hash -r
+            fi
           fi
           # wrk
           if ! command -v wrk &>/dev/null; then
@@ -83,15 +90,21 @@ jobs:
 
       - name: Build Sentinel-CC
         run: |
+          # Build SentinelPass against the correct LLVM version (must match clang)
+          rm -f src/compiler/build/CMakeCache.txt
+          mkdir -p src/compiler/build
+          cd src/compiler/build
+          cmake .. -DLLVM_DIR="/usr/lib/llvm-${LLVM_VER}/lib/cmake/llvm"
+          make -j$(nproc)
+          cd "$GITHUB_WORKSPACE"
           if [ "$BTF_OK" = "true" ]; then
             make -j$(nproc)
           else
-            # Skip BPF object + loader (need full vmlinux.h), build everything else
-            make -j$(nproc) pass sign_tool || true
+            make -j$(nproc) sign_tool keys
           fi
 
       - name: Build benchmarks & attacks
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: |
           make -j$(nproc) victim_bench attacks
           clang -fpass-plugin=src/compiler/build/SentinelPass.so -O2 \
