@@ -66,19 +66,18 @@ jobs:
           if [ "$BTF" = false ]; then
             echo "::warning::No BTF — BPF compilation and enforcement tests will be skipped"
             # Minimal vmlinux.h so non-BPF build targets don't fail
-            cat > vmlinux.h << 'EOF'
-#ifndef __VMLINUX_H__
-#define __VMLINUX_H__
-typedef unsigned char __u8;
-typedef unsigned int __u32;
-typedef unsigned long long __u64;
-typedef int __s32;
-typedef long long __s64;
-typedef __u32 pid_t;
-typedef _Bool bool;
-enum { false = 0, true = 1 };
-#endif
-EOF
+            printf '%s\n' \
+              '#ifndef __VMLINUX_H__' \
+              '#define __VMLINUX_H__' \
+              'typedef unsigned char __u8;' \
+              'typedef unsigned int __u32;' \
+              'typedef unsigned long long __u64;' \
+              'typedef int __s32;' \
+              'typedef long long __s64;' \
+              'typedef __u32 pid_t;' \
+              'typedef _Bool bool;' \
+              'enum { false = 0, true = 1 };' \
+              '#endif' > vmlinux.h
           fi
           echo "BTF_OK=$BTF" >> "$GITHUB_ENV"
 
