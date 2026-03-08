@@ -126,8 +126,13 @@ bench: victim_bench loader
 	sudo ./benchmark.sh
 
 # 5. Build Kernel Enforcer
+# -nostdinc avoids system bpf headers that may lack vmlinux.h types on Ubuntu
+# Then re-add clang builtins (stddef.h) and libbpf headers via -idirafter
+CLANG_BPF_FLAGS := -g -O2 -target bpf -D__TARGET_ARCH_$(ARCH) -nostdinc \
+	-isystem $(shell $(CLANG) -print-resource-dir)/include \
+	-I. -I/usr/include
 sentinel.bpf.o: $(SRC_KERNEL)/sentinel.bpf.c $(SRC_COMMON)/sentinel_shared.h vmlinux.h
-	$(CLANG) -g -O2 -target bpf -D__TARGET_ARCH_$(ARCH) -I. -c $(SRC_KERNEL)/sentinel.bpf.c -o sentinel.bpf.o
+	$(CLANG) $(CLANG_BPF_FLAGS) -c $(SRC_KERNEL)/sentinel.bpf.c -o sentinel.bpf.o
 
 sentinel.skel.h: sentinel.bpf.o
 	$(BPFTOOL) gen skeleton sentinel.bpf.o > sentinel.skel.h
