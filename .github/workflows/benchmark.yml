@@ -128,11 +128,17 @@ jobs:
         if: env.BTF_OK == 'true'
         continue-on-error: true
         timeout-minutes: 10
+        shell: bash {0}
         run: |
+          set +e  # Don't exit on errors — we handle them ourselves
           chmod +x benchmarks/macro_bench.sh
           sudo systemctl stop nginx redis-server 2>/dev/null || true
+          echo "::group::Macro benchmark output"
           # timeout OUTSIDE sudo so signals propagate from GH Actions -> timeout -> sudo -> script
-          timeout --foreground --signal=TERM --kill-after=30 540 sudo -E ./benchmarks/macro_bench.sh 3 480 2>&1 || true
+          timeout --foreground --signal=TERM --kill-after=30 540 sudo -E ./benchmarks/macro_bench.sh 3 480 2>&1
+          BENCH_EXIT=$?
+          echo "::endgroup::"
+          echo "macro_bench.sh exited with code: $BENCH_EXIT"
           # Always clean up all possible orphans
           sudo pkill -9 -f './loader' 2>/dev/null || true
           sudo pkill -9 -f 'victim_phase2' 2>/dev/null || true
