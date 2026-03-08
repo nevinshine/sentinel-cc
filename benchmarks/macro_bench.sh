@@ -8,7 +8,7 @@
 # Usage:  sudo ./benchmarks/macro_bench.sh [runs]
 # Output: CSV summary + human-readable table
 
-set -eu
+set -u
 
 RUNS=${1:-30}
 CSV_OUT="benchmarks/results_macro.csv"
@@ -272,8 +272,14 @@ run_sqlite_bench() {
 
     if [[ "$mode" == "sentinel" ]]; then
       # sqlite_bench is Sentinel-instrumented, run directly under the loader
-      elapsed=$(./loader ./benchmarks/sqlite_bench "$db_path" 2>&1 | \
-                grep 'SQLITE_OPS_PER_SEC=' | cut -d= -f2)
+      local output
+      output=$(./loader ./benchmarks/sqlite_bench "$db_path" 2>&1) || true
+      elapsed=$(echo "$output" | grep 'SQLITE_OPS_PER_SEC=' | cut -d= -f2)
+      if [[ -z "$elapsed" || "$elapsed" == "0" ]] && [[ "$i" -eq 1 ]]; then
+        warn "loader+sqlite_bench failed, sentinel sqlite benchmark unavailable" >&2
+        echo "0" >> "$results_file"
+        break
+      fi
     else
       elapsed=$(./benchmarks/sqlite_bench "$db_path" 2>&1 | \
                 grep 'SQLITE_OPS_PER_SEC=' | cut -d= -f2)

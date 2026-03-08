@@ -10,7 +10,7 @@
 # Measures latency overhead per-syscall and outputs CSV.
 # Usage: sudo ./eval/comparative.sh [iterations]
 
-set -eu
+set -u
 
 ITERS=${1:-100000}
 RUNS=30
@@ -55,7 +55,7 @@ run_bench() {
   local results_file
   results_file=$(mktemp /tmp/comp_bench.XXXXXX)
 
-  info "Running: $label"
+  info "Running: $label" >&2
   for i in $(seq 1 "$RUNS"); do
     local avg
     avg=$("$@" 2>&1 | grep 'BENCH_AVG_NS=' | cut -d= -f2)

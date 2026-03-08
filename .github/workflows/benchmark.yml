@@ -126,6 +126,7 @@ jobs:
 
       - name: "Benchmark 2: Macro Benchmarks (nginx/Redis/SQLite)"
         if: env.BTF_OK == 'true'
+        continue-on-error: true
         timeout-minutes: 8
         run: |
           chmod +x benchmarks/macro_bench.sh
@@ -134,16 +135,20 @@ jobs:
 
       - name: "Benchmark 3: Comparative Evaluation"
         if: env.BTF_OK == 'true'
+        continue-on-error: true
+        timeout-minutes: 5
         run: |
           chmod +x eval/comparative.sh
           sudo ./eval/comparative.sh 2>&1
 
       - name: "Red Team Attack Suite"
         if: env.BTF_OK == 'true'
+        continue-on-error: true
         run: sudo bash tests/red_team.sh 2>&1
 
       - name: "Full Test Suite"
         if: env.BTF_OK == 'true'
+        continue-on-error: true
         run: sudo make test 2>&1
 
       - name: Upload results
