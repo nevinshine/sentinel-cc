@@ -13,7 +13,6 @@ set -u
 RUNS=${1:-30}
 CSV_OUT="benchmarks/results_macro.csv"
 TMPOUT=$(mktemp /tmp/sentinel_macro.XXXXXX)
-trap 'rm -f "$TMPOUT"; cleanup_servers' EXIT
 
 BOLD='\033[1m'
 GREEN='\033[0;32m'
@@ -31,10 +30,14 @@ warn()  { echo -e "${YELLOW}[!]${NC} $*"; }
 PIDS=()
 cleanup_servers() {
   for p in "${PIDS[@]:-}"; do
+    [[ -z "$p" ]] && continue
     kill "$p" 2>/dev/null || true
-    wait "$p" 2>/dev/null || true
+    kill -9 "$p" 2>/dev/null || true
   done
 }
+
+trap 'rm -f "$TMPOUT"; cleanup_servers' EXIT
+trap '' TERM  # Ignore SIGTERM in main script (let cleanup handle it)
 
 setup_keyring() {
   if [ ! -f pub.pem ]; then
@@ -84,7 +87,7 @@ setup_keyring
 
 # Start BPF hooks in system-wide mode using a long-running instrumented binary
 start_bpf_hooks() {
-  ./loader --system-wide ./victim_phase2 > /dev/null 2>&1 &
+  setsid ./loader --system-wide ./victim_phase2 > /dev/null 2>&1 &
   BPF_LOADER_PID=$!
   PIDS+=("$BPF_LOADER_PID")
   sleep 2  # Let BPF programs attach
@@ -93,10 +96,12 @@ start_bpf_hooks() {
 stop_bpf_hooks() {
   if [[ -n "${BPF_LOADER_PID:-}" ]]; then
     kill "$BPF_LOADER_PID" 2>/dev/null || true
-    wait "$BPF_LOADER_PID" 2>/dev/null || true
+    # Don't wait — setsid children can't be waited on reliably
+    sleep 0.5
+    # Ensure it's dead
+    kill -9 "$BPF_LOADER_PID" 2>/dev/null || true
     PIDS=("${PIDS[@]/$BPF_LOADER_PID/}")
     BPF_LOADER_PID=""
-    sleep 0.3
   fi
 }
 
