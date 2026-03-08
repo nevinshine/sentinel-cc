@@ -7,7 +7,7 @@
 > Traditional security tools rely on external, manually maintained policy files. Sentinel-CC inverts this model:
 > 1. **Compiler-Generated Policy:** The compiler (LLVM Pass) analyzes the CFG to generate a precise whitelist of valid syscalls, CFI ranges, and library import lists.
 > 2. **Embedded Trust:** Policy (`.sentinel`), CFI metadata (`.sentinel_cfi`), and import tables (`.sentinel_imports`) are cryptographically bound to the code via an **Ed25519** signature.
-> 3. **Kernel Enforcement:** 16 eBPF fentry hooks + fork tracking refuse any syscall that doesn't match the signed policy.
+> 3. **Kernel Enforcement:** 19 eBPF fentry hooks + fork tracking refuse any syscall that doesn't match the signed policy.
 > 4. **Per-App Attack Surface Reduction:** Call-graph analysis through libc whitelists only the syscall sites *reachable* from the binary's actual imports — not the entire library.
 > 
 > 
@@ -29,7 +29,7 @@ graph LR
 * **Compiler:** Injects `.sentinel` policy, `.sentinel_cfi` caller-range metadata, `.sentinel_imports` (external function list), and `.signature` placeholder. Detects inline `syscall`, `int $0x80`, obfuscated `.byte 0x0f, 0x05`, and 50+ libc wrappers.
 * **Signer:** Signs `Hash(.text + .sentinel + .sentinel_cfi + .sentinel_imports)` with **Ed25519**.
 * **Loader:** Verifies signature (with key-revocation checks) via **Linux Kernel Keyring**, performs **call-graph BFS through libc** to whitelist only reachable syscall sites, loads generalized CFI from `.sentinel_cfi`, and populates BPF maps.
-* **Enforcer:** eBPF programs validate `RIP` at every security-sensitive syscall across **16 fentry hooks + 1 fork tracepoint** (17 total).
+* **Enforcer:** eBPF programs validate `RIP` at every security-sensitive syscall across **19 fentry hooks + 5 fexit hooks + 1 fork tracepoint** (25 total).
 * **Auditor:** 256 KB ring buffer streams structured enforcement events to userspace in real-time.
 
 ### Enforcement Algorithm (eBPF Hot Path)
@@ -238,7 +238,7 @@ sudo ./loader --audit ./victim
 
 ### Multi-Syscall Enforcement
 
-The eBPF enforcer hooks **16 security-sensitive syscalls** + 1 tracepoint (17 total):
+The eBPF enforcer hooks **19 security-sensitive syscalls** + 5 fexit + 1 tracepoint (25 total):
 
 | Hook | Syscall | NR | Purpose |
 |------|---------|----|---------|
@@ -258,11 +258,14 @@ The eBPF enforcer hooks **16 security-sensitive syscalls** + 1 tracepoint (17 to
 | `fentry/__x64_sys_close` | close | 3 | Fd lifecycle control |
 | `fentry/__x64_sys_ioctl` | ioctl | 16 | Device control |
 | `fentry/__x64_sys_seccomp` | seccomp | 317 | Filter tampering (**unconditional block**) |
+| `fentry/__x64_sys_bpf` | bpf | 321 | BPF map tampering (**unconditional block**) |
+| `fentry/__x64_sys_unshare` | unshare | 272 | Namespace escape (**unconditional block**) |
+| `fentry/__x64_sys_setns` | setns | 308 | Namespace injection (**unconditional block**) |
 | `tp/sched/sched_process_fork` | fork | — | Child PID inheritance |
 
 > [!NOTE]
-> **Syscall Selection Rationale (16/335).**
-> Sentinel-CC intentionally hooks only **security-sensitive syscalls** — those that enable code execution, memory permission changes, process manipulation, network access, and file descriptor abuse. Hooking all ~335 x86-64 syscalls would add overhead with negligible security benefit: the vast majority (e.g., `getpid`, `clock_gettime`, `gettimeofday`) cannot be weaponized for privilege escalation or code injection. The 16 hooked syscalls cover the attack classes identified in the threat model (see [docs/threat-model.md](docs/threat-model.md)). Unhooked syscalls that are security-neutral (e.g., `stat`, `lseek`, `nanosleep`) pass through with zero Sentinel overhead.
+> **Syscall Selection Rationale (19/335).**
+> Sentinel-CC intentionally hooks only **security-sensitive syscalls** — those that enable code execution, memory permission changes, process manipulation, network access, file descriptor abuse, and kernel object tampering. The 3 new kernel object monitoring hooks (bpf, unshare, setns) prevent BPF map manipulation and namespace escape attacks. Hooking all ~335 x86-64 syscalls would add overhead with negligible security benefit. The 19 hooked syscalls cover the attack classes identified in the threat model (see [docs/threat-model.md](docs/threat-model.md)).
 
 ### Audit Ring Buffer
 

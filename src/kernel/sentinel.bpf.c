@@ -496,6 +496,50 @@ int BPF_PROG(sentinel_seccomp_check) {
   return 0;
 }
 
+// --- Kernel Object Monitoring ---
+// Block bpf(), unshare(), and setns() for monitored processes.
+// These syscalls can tamper with BPF maps, escape namespaces,
+// or detach from cgroup-based enforcement scopes.
+
+SEC("fentry/__x64_sys_bpf")
+int BPF_PROG(sentinel_bpf_check) {
+  u64 pid_tgid = bpf_get_current_pid_tgid();
+  u32 tgid = pid_tgid >> 32;
+  u32 *target = bpf_map_lookup_elem(&target_pid_map, &tgid);
+  if (!target)
+    return 0;
+  u32 tid = (u32)pid_tgid;
+  bpf_printk("Sentinel [KOBJ] TID=%d bpf() denied for monitored process", tid);
+  deny_action(tgid, tid, 0, 0, 0, 321, EVENT_KOBJ_DENY);
+  return 0;
+}
+
+SEC("fentry/__x64_sys_unshare")
+int BPF_PROG(sentinel_unshare_check) {
+  u64 pid_tgid = bpf_get_current_pid_tgid();
+  u32 tgid = pid_tgid >> 32;
+  u32 *target = bpf_map_lookup_elem(&target_pid_map, &tgid);
+  if (!target)
+    return 0;
+  u32 tid = (u32)pid_tgid;
+  bpf_printk("Sentinel [KOBJ] TID=%d unshare() denied for monitored process", tid);
+  deny_action(tgid, tid, 0, 0, 0, 272, EVENT_KOBJ_DENY);
+  return 0;
+}
+
+SEC("fentry/__x64_sys_setns")
+int BPF_PROG(sentinel_setns_check) {
+  u64 pid_tgid = bpf_get_current_pid_tgid();
+  u32 tgid = pid_tgid >> 32;
+  u32 *target = bpf_map_lookup_elem(&target_pid_map, &tgid);
+  if (!target)
+    return 0;
+  u32 tid = (u32)pid_tgid;
+  bpf_printk("Sentinel [KOBJ] TID=%d setns() denied for monitored process", tid);
+  deny_action(tgid, tid, 0, 0, 0, 308, EVENT_KOBJ_DENY);
+  return 0;
+}
+
 // --- Fork Tracking ---
 // Automatically enroll child processes when a monitored parent forks/clones.
 // This prevents fork-and-escape attacks where a child runs unmonitored.

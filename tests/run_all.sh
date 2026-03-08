@@ -55,7 +55,8 @@ check_prereqs() {
     pass "Running as root"
   fi
 
-  return $ok
+  # In bash, return 0 = success, return 1 = failure
+  [ "$ok" -eq 1 ] && return 0 || return 1
 }
 
 # Build everything

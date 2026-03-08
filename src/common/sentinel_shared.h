@@ -27,7 +27,7 @@
 #endif
 
 // --- Version ---
-#define SENTINEL_VERSION "4.4.0"
+#define SENTINEL_VERSION "4.5.0"
 
 // --- Module IDs ---
 #define MODULE_MAIN         1
@@ -54,6 +54,7 @@
 #define EVENT_SHADOW_OK  11  // Shadow stack validation passed
 #define EVENT_SHADOW_FAIL 12 // Shadow stack validation failed
 #define EVENT_FALLBACK   13  // System-wide fallback policy applied
+#define EVENT_KOBJ_DENY  14  // Kernel object manipulation denied (bpf/unshare/setns)
 
 // --- Max constants ---
 #define MAX_SHADOW_DEPTH 8  // Max stack frames for shadow stack CFI

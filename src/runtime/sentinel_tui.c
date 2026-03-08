@@ -72,6 +72,7 @@ static unsigned long total_lib_deny = 0;
 static unsigned long total_shadow_ok = 0;
 static unsigned long total_shadow_fail = 0;
 static unsigned long total_fallback = 0;
+static unsigned long total_kobj_deny = 0;
 static unsigned long total_events = 0;
 
 static struct tui_event history[MAX_HISTORY];
@@ -101,7 +102,10 @@ static const char *syscall_name(unsigned int nr) {
   case 257: return "openat";
   case 311: return "vm_writev";
   case 317: return "seccomp";
+  case 272: return "unshare";
+  case 308: return "setns";
   case 319: return "memfd_create";
+  case 321: return "bpf";
   default:  return NULL;
   }
 }
@@ -222,6 +226,9 @@ static void update_stats(const struct tui_event *evt) {
     total_block++;
   } else if (strcmp(evt->action, "FALLBACK") == 0) {
     total_fallback++;
+    total_block++;
+  } else if (strcmp(evt->action, "KOBJ-DENY") == 0) {
+    total_kobj_deny++;
     total_block++;
   }
 

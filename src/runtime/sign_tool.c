@@ -3,7 +3,7 @@
 //
 // Usage: ./sign_tool [--help] [--version] <binary_path> <private_key.pem>
 
-#define SENTINEL_VERSION "4.0.0"
+#define SENTINEL_VERSION "4.5.0"
 
 #include <fcntl.h>
 #include <gelf.h>
@@ -14,19 +14,103 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #define SIG_SIZE 64 // Ed25519
 
 static void print_usage(const char *prog) {
   printf("Sentinel-CC Signing Tool v%s\n\n", SENTINEL_VERSION);
-  printf("Usage: %s [options] <binary> <private.pem>\n\n", prog);
+  printf("Usage: %s [options] <binary> <private.pem>\n", prog);
+  printf("       %s --revoke <pub.pem> <reason> [crl_file]\n", prog);
+  printf("       %s --fingerprint <pub.pem>\n\n", prog);
   printf("Signs a Sentinel-instrumented binary by computing\n");
   printf("Ed25519(SHA-256(.text + .sentinel)) and writing the\n");
   printf("signature into the .signature ELF section.\n\n");
-  printf("Options:\n");
+  printf("Commands:\n");
+  printf("  --revoke PEM REASON [FILE]  Add key to CRL (default: /etc/sentinel/policy.crl)\n");
+  printf("  --fingerprint PEM          Print SHA-256 fingerprint of public key\n");
+  printf("\nOptions:\n");
   printf("  --help       Show this help message\n");
   printf("  --version    Show version\n");
+}
+
+// Generate a CRL entry for the given public key
+static int cmd_revoke(const char *pem_path, const char *reason, const char *crl_path) {
+  FILE *fp = fopen(pem_path, "r");
+  if (!fp) { perror("fopen pubkey"); return 1; }
+  EVP_PKEY *pub = PEM_read_PUBKEY(fp, NULL, NULL, NULL);
+  fclose(fp);
+  if (!pub) {
+    fprintf(stderr, "[FATAL] Cannot read public key from %s\n", pem_path);
+    ERR_print_errors_fp(stderr);
+    return 1;
+  }
+
+  // Compute SHA-256 fingerprint
+  unsigned char *der = NULL;
+  int der_len = i2d_PUBKEY(pub, &der);
+  EVP_PKEY_free(pub);
+  if (der_len <= 0) { fprintf(stderr, "[FATAL] DER encode failed\n"); return 1; }
+
+  unsigned char hash[32];
+  unsigned int hlen = 0;
+  EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+  EVP_DigestInit_ex(ctx, EVP_sha256(), NULL);
+  EVP_DigestUpdate(ctx, der, der_len);
+  EVP_DigestFinal_ex(ctx, hash, &hlen);
+  EVP_MD_CTX_free(ctx);
+  OPENSSL_free(der);
+
+  char hex[65];
+  for (unsigned int i = 0; i < hlen; i++)
+    snprintf(hex + i * 2, 3, "%02x", hash[i]);
+  hex[64] = '\0';
+
+  // Append to CRL file
+  FILE *crl = fopen(crl_path, "a+");
+  if (!crl) { perror("fopen CRL"); return 1; }
+
+  // Check if file is empty (needs header)
+  fseek(crl, 0, SEEK_END);
+  if (ftell(crl) == 0) {
+    fprintf(crl, "# Sentinel-CC Certificate Revocation List\n");
+    fprintf(crl, "VERSION 1\n");
+  }
+  fprintf(crl, "TIMESTAMP %ld\n", (long)time(NULL));
+  fprintf(crl, "REVOKE %s %s\n", hex, reason);
+  fclose(crl);
+
+  printf("[Revoke] Key %s revoked (reason: %s)\n", hex, reason);
+  printf("[Revoke] CRL updated: %s\n", crl_path);
+  return 0;
+}
+
+static int cmd_fingerprint(const char *pem_path) {
+  FILE *fp = fopen(pem_path, "r");
+  if (!fp) { perror("fopen"); return 1; }
+  EVP_PKEY *pub = PEM_read_PUBKEY(fp, NULL, NULL, NULL);
+  fclose(fp);
+  if (!pub) { fprintf(stderr, "Cannot read key\n"); return 1; }
+
+  unsigned char *der = NULL;
+  int der_len = i2d_PUBKEY(pub, &der);
+  EVP_PKEY_free(pub);
+  if (der_len <= 0) return 1;
+
+  unsigned char hash[32];
+  unsigned int hlen = 0;
+  EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+  EVP_DigestInit_ex(ctx, EVP_sha256(), NULL);
+  EVP_DigestUpdate(ctx, der, der_len);
+  EVP_DigestFinal_ex(ctx, hash, &hlen);
+  EVP_MD_CTX_free(ctx);
+  OPENSSL_free(der);
+
+  for (unsigned int i = 0; i < hlen; i++)
+    printf("%02x", hash[i]);
+  printf("\n");
+  return 0;
 }
 
 int main(int argc, char **argv) {
@@ -40,6 +124,21 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-v") == 0) {
       printf("Sentinel-CC Signing Tool v%s\n", SENTINEL_VERSION);
       return 0;
+    }
+    if (strcmp(argv[i], "--revoke") == 0) {
+      if (i + 2 >= argc) {
+        fprintf(stderr, "Usage: %s --revoke <pub.pem> <reason> [crl_file]\n", argv[0]);
+        return 1;
+      }
+      const char *crl = (i + 3 < argc) ? argv[i + 3] : "/etc/sentinel/policy.crl";
+      return cmd_revoke(argv[i + 1], argv[i + 2], crl);
+    }
+    if (strcmp(argv[i], "--fingerprint") == 0) {
+      if (i + 1 >= argc) {
+        fprintf(stderr, "Usage: %s --fingerprint <pub.pem>\n", argv[0]);
+        return 1;
+      }
+      return cmd_fingerprint(argv[i + 1]);
     }
     arg_start = i;
     break;

@@ -18,6 +18,7 @@
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
+#include <openssl/store.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -114,6 +115,47 @@ static void handle_openssl_error(const char *context) {
 static int is_key_revoked(EVP_PKEY *pub);
 
 // =============================================================================
+// TPM2 Key Loading via OpenSSL STORE API (tpm2-tss-engine/pkcs11)
+// Uses OSSL_STORE_open() to load public key from a PKCS#11 or TPM2 URI.
+// Requires tpm2-tss-engine or pkcs11 provider installed on the system.
+// =============================================================================
+#define TPM2_DEFAULT_URI "pkcs11:token=sentinel;object=pubkey;type=public"
+
+static EVP_PKEY *load_tpm2_pubkey(void) {
+  const char *uri = getenv("SENTINEL_TPM_URI");
+  if (!uri)
+    uri = TPM2_DEFAULT_URI;
+
+  OSSL_STORE_CTX *store = OSSL_STORE_open(uri, NULL, NULL, NULL, NULL);
+  if (!store) {
+    fprintf(stderr, "[FATAL] TPM2: Cannot open PKCS#11 store URI: %s\n", uri);
+    ERR_print_errors_fp(stderr);
+    return NULL;
+  }
+
+  EVP_PKEY *pkey = NULL;
+  while (!OSSL_STORE_eof(store)) {
+    OSSL_STORE_INFO *info = OSSL_STORE_load(store);
+    if (!info)
+      continue;
+    int type = OSSL_STORE_INFO_get_type(info);
+    if (type == OSSL_STORE_INFO_PKEY) {
+      pkey = OSSL_STORE_INFO_get1_PKEY(info);
+      OSSL_STORE_INFO_free(info);
+      break;
+    }
+    OSSL_STORE_INFO_free(info);
+  }
+  OSSL_STORE_close(store);
+
+  if (!pkey)
+    fprintf(stderr, "[FATAL] TPM2: No public key found at URI: %s\n", uri);
+  else
+    printf("[Loader] TPM2: Loaded public key from %s\n", uri);
+  return pkey;
+}
+
+// =============================================================================
 // Verify Binary Signature via Kernel Keyring
 // Returns the verified open fd on success (caller must close), or -1 on error.
 // Keeping the fd open prevents TOCTOU — caller can fexecve() from this fd.
@@ -179,6 +221,12 @@ static int verify_signature(const char *binary_path) {
     goto out;
   }
 
+  // Load Public Key — from TPM2 or from Kernel Keyring
+  if (g_use_tpm) {
+    pub = load_tpm2_pubkey();
+    if (!pub)
+      goto out;
+  } else {
   // Load Public Key from Session Keyring
   key_serial_t key_id =
       keyctl_search(KEY_SPEC_SESSION_KEYRING, "user", "sentinel:pubkey", 0);
@@ -215,6 +263,7 @@ static int verify_signature(const char *binary_path) {
   pub = PEM_read_bio_PUBKEY(bio, NULL, NULL, NULL);
   if (!pub)
     handle_openssl_error("PEM_read_bio_PUBKEY");
+  } // end keyring path
 
   // Key revocation check
   if (is_key_revoked(pub)) {
@@ -1158,7 +1207,61 @@ static int trace_lib_callgraph(const char *lib_path,
 // =============================================================================
 // Key Revocation: Check if the current public key is revoked
 // Reads /etc/sentinel/revoked_keys (SHA-256 fingerprints, hex, one per line)
+// Also checks /etc/sentinel/policy.crl for signed revocation entries.
+// CRL format: "VERSION 1\nTIMESTAMP <epoch>\nREVOKE <hex_fingerprint> <reason>\n"
 // =============================================================================
+
+// Parse a CRL file and check if the given fingerprint is listed
+static int check_crl_file(const char *crl_path, const char *fp_hex) {
+  FILE *cfp = fopen(crl_path, "r");
+  if (!cfp) return 0;
+
+  char line[512];
+  int version_ok = 0;
+  time_t crl_timestamp = 0;
+
+  while (fgets(line, sizeof(line), cfp)) {
+    char *nl = strchr(line, '\n');
+    if (nl) *nl = '\0';
+    if (line[0] == '#' || line[0] == '\0') continue;
+
+    if (strncmp(line, "VERSION ", 8) == 0) {
+      int ver = atoi(line + 8);
+      if (ver != 1) {
+        fprintf(stderr, "[WARN] Unknown CRL version %d in %s\n", ver, crl_path);
+        fclose(cfp);
+        return 0;
+      }
+      version_ok = 1;
+      continue;
+    }
+    if (strncmp(line, "TIMESTAMP ", 10) == 0) {
+      crl_timestamp = (time_t)strtol(line + 10, NULL, 10);
+      // Reject CRL older than 30 days
+      time_t now = time(NULL);
+      if (now - crl_timestamp > 30 * 86400) {
+        fprintf(stderr, "[WARN] CRL expired (>30 days old) in %s\n", crl_path);
+        fclose(cfp);
+        return 0; // Expired CRL = not trustworthy
+      }
+      continue;
+    }
+    if (strncmp(line, "REVOKE ", 7) == 0 && version_ok) {
+      // Format: REVOKE <64-char hex fingerprint> <reason>
+      if (strncmp(line + 7, fp_hex, 64) == 0) {
+        const char *reason = (strlen(line) > 71) ? line + 72 : "unspecified";
+        fprintf(stderr,
+                "[FATAL] Key REVOKED via CRL (reason: %s, fingerprint: %.16s...)\n",
+                reason, fp_hex);
+        fclose(cfp);
+        return 1;
+      }
+    }
+  }
+  fclose(cfp);
+  return 0;
+}
+
 static int is_key_revoked(EVP_PKEY *pub) {
   // Compute SHA-256 fingerprint of the public key DER encoding
   unsigned char *der = NULL;
@@ -1181,24 +1284,29 @@ static int is_key_revoked(EVP_PKEY *pub) {
     snprintf(fp_hex + i * 2, 3, "%02x", fp[i]);
   fp_hex[64] = '\0';
 
-  // Check revocation file
+  // 1. Check legacy flat-file revocation list
   FILE *rfp = fopen("/etc/sentinel/revoked_keys", "r");
-  if (!rfp) return 0; // No revocation file — not revoked
-  char line[256];
-  while (fgets(line, sizeof(line), rfp)) {
-    // Strip newline
-    char *nl = strchr(line, '\n');
-    if (nl) *nl = '\0';
-    // Skip comments and empty lines
-    if (line[0] == '#' || line[0] == '\0') continue;
-    if (strncmp(line, fp_hex, 64) == 0) {
-      fclose(rfp);
-      fprintf(stderr, "[FATAL] Public key is REVOKED (fingerprint: %.16s...)\n",
-              fp_hex);
-      return 1;
+  if (rfp) {
+    char line[256];
+    while (fgets(line, sizeof(line), rfp)) {
+      char *nl = strchr(line, '\n');
+      if (nl) *nl = '\0';
+      if (line[0] == '#' || line[0] == '\0') continue;
+      if (strncmp(line, fp_hex, 64) == 0) {
+        fclose(rfp);
+        fprintf(stderr,
+                "[FATAL] Public key is REVOKED (fingerprint: %.16s...)\n",
+                fp_hex);
+        return 1;
+      }
     }
+    fclose(rfp);
   }
-  fclose(rfp);
+
+  // 2. Check structured CRL file (with version, timestamp, reasons)
+  if (check_crl_file("/etc/sentinel/policy.crl", fp_hex))
+    return 1;
+
   return 0;
 }
 
@@ -1399,6 +1507,7 @@ static const char *action_str(uint8_t action) {
   case EVENT_SHADOW_OK:   return "SHADOW-OK";
   case EVENT_SHADOW_FAIL: return "SHADOW-FAIL";
   case EVENT_FALLBACK:    return "FALLBACK";
+  case EVENT_KOBJ_DENY:   return "KOBJ-DENY";
   default:                return "UNKNOWN";
   }
 }
