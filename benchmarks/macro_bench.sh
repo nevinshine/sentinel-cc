@@ -91,10 +91,18 @@ setup_keyring
 
 # Start BPF hooks in system-wide mode using a long-running instrumented binary
 start_bpf_hooks() {
+  info "  Starting BPF hooks (loader --system-wide)..."
   ./loader --system-wide ./victim_phase2 > /dev/null 2>&1 &
   BPF_LOADER_PID=$!
   disown "$BPF_LOADER_PID"          # detach from job table
   sleep 2  # Let BPF programs attach
+  # Verify loader is running
+  if ! kill -0 "$BPF_LOADER_PID" 2>/dev/null; then
+    warn "  BPF loader (PID $BPF_LOADER_PID) exited early"
+    BPF_LOADER_PID=""
+    return 1
+  fi
+  info "  BPF hooks active (loader PID $BPF_LOADER_PID)"
 }
 
 stop_bpf_hooks() {
@@ -119,6 +127,7 @@ run_nginx_bench() {
   fi
 
   for i in $(seq 1 "$RUNS"); do
+    info "  nginx $mode run $i/$RUNS" >&2
     # Ensure port is free
     killall nginx 2>/dev/null || true; sleep 0.1
     nginx -c "$(pwd)/benchmarks/nginx_bench.conf" &
@@ -211,6 +220,7 @@ run_redis_bench() {
   fi
 
   for i in $(seq 1 "$RUNS"); do
+    info "  redis $mode run $i/$RUNS" >&2
     # Ensure port is free
     killall redis-server 2>/dev/null || true; sleep 0.1
     redis-server --port 7777 --save "" --appendonly no --loglevel warning &
@@ -275,6 +285,7 @@ run_sqlite_bench() {
   local db_path="/tmp/sentinel_bench.db"
 
   for i in $(seq 1 "$RUNS"); do
+    info "  sqlite $mode run $i/$RUNS" >&2
     rm -f "$db_path"
     local elapsed
 
