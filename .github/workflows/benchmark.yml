@@ -16,29 +16,31 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang llvm lld libbpf-dev libelf-dev \
-            libssl-dev libkeyutils-dev cmake make linux-tools-common \
-            linux-tools-$(uname -r) || true
-          # bpftool
-          which bpftool || sudo apt-get install -y linux-tools-generic || true
+            libssl-dev libkeyutils-dev cmake make \
+            nginx redis-server redis-tools libsqlite3-dev libseccomp-dev
+          # bpftool — try kernel-specific first, then generic
+          sudo apt-get install -y linux-tools-$(uname -r) 2>/dev/null \
+            || sudo apt-get install -y linux-tools-generic 2>/dev/null \
+            || echo "::warning::bpftool not available"
           # wrk
-          sudo apt-get install -y wrk || (
-            git clone --depth 1 https://github.com/wg/wrk.git /tmp/wrk
-            cd /tmp/wrk && make -j$(nproc) WITH_OPENSSL=/usr && sudo cp wrk /usr/local/bin/
-          ) || true
-          # nginx, redis, sqlite
-          sudo apt-get install -y nginx redis-server redis-tools libsqlite3-dev
-          # libseccomp
-          sudo apt-get install -y libseccomp-dev
-
-      - name: Check BTF
-        run: |
-          if [ -f /sys/kernel/btf/vmlinux ]; then
-            echo "BTF available ✓"
-            bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
-          else
-            echo "::warning::BTF not available — BPF enforcement tests will be skipped"
-            echo "BTF_AVAILABLE=false" >> "$GITHUB_ENV"
+          if ! command -v wrk &>/dev/null; then
+            sudo apt-get install -y wrk 2>/dev/null || (
+              sudo apt-get install -y libssl-dev
+              git clone --depth 1 https://github.com/wg/wrk.git /tmp/wrk
+              cd /tmp/wrk && make -j$(nproc) WITH_OPENSSL=/usr && sudo cp wrk /usr/local/bin/
+            ) || echo "::warning::wrk not available"
           fi
+
+      - name: Generate vmlinux.h
+        run: |
+          BTF=true
+          if [ -f /sys/kernel/btf/vmlinux ] && command -v bpftool &>/dev/null; then
+            bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h && echo "BTF + vmlinux.h ✓"
+          else
+            echo "::warning::BTF/bpftool not available — using shipped vmlinux.h or skipping BPF tests"
+            BTF=false
+          fi
+          echo "BTF_OK=$BTF" >> "$GITHUB_ENV"
 
       - name: Build Sentinel-CC
         run: make -j$(nproc) 2>&1 | tail -20
@@ -47,15 +49,11 @@ jobs:
         run: |
           make victim_bench 2>&1 | tail -5
           make attacks 2>&1 | tail -5
-          # SQLite bench (instrumented)
           clang -fpass-plugin=src/compiler/build/SentinelPass.so -O2 \
             benchmarks/sqlite_bench.c -lsqlite3 -o benchmarks/sqlite_bench
           ./sign_tool benchmarks/sqlite_bench priv.pem
-          # Comparative eval harnesses
           cc -O2 eval/landlock_harness.c -o eval/landlock_harness 2>/dev/null || true
-          if pkg-config --exists libseccomp 2>/dev/null; then
-            cc -O2 eval/seccomp_harness.c -lseccomp -o eval/seccomp_harness
-          fi 2>/dev/null || true
+          cc -O2 eval/seccomp_harness.c -lseccomp -o eval/seccomp_harness 2>/dev/null || true
 
       - name: Setup keyring
         run: |
@@ -63,27 +61,27 @@ jobs:
           sudo keyctl setperm $(keyctl search @s user sentinel:pubkey) 0x3f3f3f3f
 
       - name: "Benchmark 1: Syscall Latency (microbenchmark)"
-        if: env.BTF_AVAILABLE != 'false'
+        if: env.BTF_OK == 'true'
         run: sudo ./benchmark.sh 2>&1
 
       - name: "Benchmark 2: Macro Benchmarks (nginx/Redis/SQLite)"
-        if: env.BTF_AVAILABLE != 'false'
+        if: env.BTF_OK == 'true'
         run: |
           chmod +x benchmarks/macro_bench.sh
           sudo ./benchmarks/macro_bench.sh 10 2>&1
 
       - name: "Benchmark 3: Comparative Evaluation"
-        if: env.BTF_AVAILABLE != 'false'
+        if: env.BTF_OK == 'true'
         run: |
           chmod +x eval/comparative.sh
           sudo ./eval/comparative.sh 2>&1
 
       - name: "Red Team Attack Suite"
-        if: env.BTF_AVAILABLE != 'false'
+        if: env.BTF_OK == 'true'
         run: sudo bash tests/red_team.sh 2>&1
 
       - name: "Full Test Suite"
-        if: env.BTF_AVAILABLE != 'false'
+        if: env.BTF_OK == 'true'
         run: sudo make test 2>&1
 
       - name: Upload results
