@@ -94,7 +94,6 @@ start_bpf_hooks() {
   info "  Starting BPF hooks (loader --system-wide)..."
   ./loader --system-wide ./victim_phase2 > /dev/null 2>&1 &
   BPF_LOADER_PID=$!
-  disown "$BPF_LOADER_PID"          # detach from job table
   sleep 2  # Let BPF programs attach
   # Verify loader is running
   if ! kill -0 "$BPF_LOADER_PID" 2>/dev/null; then
@@ -108,7 +107,7 @@ start_bpf_hooks() {
 stop_bpf_hooks() {
   if [[ -n "${BPF_LOADER_PID:-}" ]]; then
     kill "$BPF_LOADER_PID" 2>/dev/null || true
-    sleep 0.3
+    wait "$BPF_LOADER_PID" 2>/dev/null || true
     kill -9 "$BPF_LOADER_PID" 2>/dev/null || true
     # Also kill any leaked loader children
     pkill -9 -f './loader --system-wide' 2>/dev/null || true
