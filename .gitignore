@@ -56,3 +56,4 @@ benchmarks/sqlite_bench
 benchmarks/results_*.csv
 eval/results_*.csv
 eval/*_harness
+nohup.out

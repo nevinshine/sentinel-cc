@@ -42,7 +42,7 @@ cleanup_servers() {
 }
 
 trap 'rm -f "$TMPOUT"; cleanup_servers' EXIT
-trap 'echo "[SIGTERM] cleaning up..."; cleanup_servers; exit 143' TERM
+trap 'echo "[SIGTERM] cleaning up..."; cleanup_servers; exit 143' TERM INT
 
 setup_keyring() {
   if [ ! -f pub.pem ]; then
@@ -108,12 +108,14 @@ start_bpf_hooks() {
 stop_bpf_hooks() {
   if [[ -n "${BPF_LOADER_PID:-}" ]]; then
     kill "$BPF_LOADER_PID" 2>/dev/null || true
-    wait "$BPF_LOADER_PID" 2>/dev/null || true
+    sleep 1
     kill -9 "$BPF_LOADER_PID" 2>/dev/null || true
-    # Also kill any leaked loader children
-    pkill -9 -f './loader --system-wide' 2>/dev/null || true
+    wait "$BPF_LOADER_PID" 2>/dev/null || true
     BPF_LOADER_PID=""
   fi
+  # Belt-and-suspenders: kill any leftover loader/victim processes
+  pkill -9 -f './loader' 2>/dev/null || true
+  pkill -9 -f 'victim_phase2' 2>/dev/null || true
 }
 
 run_nginx_bench() {
