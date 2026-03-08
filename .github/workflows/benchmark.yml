@@ -21,10 +21,20 @@ jobs:
           sudo apt-get install -y clang llvm lld libbpf-dev libelf-dev \
             libssl-dev libkeyutils-dev cmake make \
             nginx redis-server redis-tools libsqlite3-dev libseccomp-dev
-          # bpftool — try kernel-specific first, then generic
-          sudo apt-get install -y linux-tools-$(uname -r) 2>/dev/null \
+          # bpftool — try kernel-specific, then azure, then generic, then build from source
+          KVER=$(uname -r)
+          sudo apt-get install -y "linux-tools-${KVER}" 2>/dev/null \
+            || sudo apt-get install -y linux-tools-azure 2>/dev/null \
             || sudo apt-get install -y linux-tools-generic 2>/dev/null \
-            || echo "::warning::bpftool not available"
+            || true
+          # Verify bpftool actually works (not just a wrapper stub)
+          if ! bpftool version &>/dev/null; then
+            echo "Package bpftool broken, building from kernel source..."
+            sudo apt-get install -y git libelf-dev libcap-dev 2>/dev/null || true
+            git clone --depth 1 https://github.com/libbpf/bpftool.git /tmp/bpftool
+            cd /tmp/bpftool/src && make -j$(nproc) && sudo cp bpftool /usr/local/bin/
+            cd -
+          fi
           # wrk
           if ! command -v wrk &>/dev/null; then
             sudo apt-get install -y wrk 2>/dev/null || (
@@ -36,17 +46,50 @@ jobs:
 
       - name: Generate vmlinux.h
         run: |
-          BTF=true
-          if [ -f /sys/kernel/btf/vmlinux ] && command -v bpftool &>/dev/null; then
-            bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h && echo "BTF + vmlinux.h ✓"
-          else
-            echo "::warning::BTF/bpftool not available — using shipped vmlinux.h or skipping BPF tests"
-            BTF=false
+          BTF=false
+          if [ -f /sys/kernel/btf/vmlinux ]; then
+            # bpftool wrapper may exist but fail for the running kernel
+            if bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h.tmp 2>/dev/null; then
+              if [ -s vmlinux.h.tmp ] && grep -q 'typedef.*__u64' vmlinux.h.tmp; then
+                mv vmlinux.h.tmp vmlinux.h
+                BTF=true
+                echo "BTF + vmlinux.h ✓"
+              else
+                rm -f vmlinux.h.tmp
+                echo "::warning::bpftool produced invalid vmlinux.h"
+              fi
+            else
+              rm -f vmlinux.h.tmp
+              echo "::warning::bpftool failed — azure kernel may need linux-tools-azure"
+            fi
+          fi
+          if [ "$BTF" = false ]; then
+            echo "::warning::No BTF — BPF compilation and enforcement tests will be skipped"
+            # Minimal vmlinux.h so non-BPF build targets don't fail
+            cat > vmlinux.h << 'EOF'
+#ifndef __VMLINUX_H__
+#define __VMLINUX_H__
+typedef unsigned char __u8;
+typedef unsigned int __u32;
+typedef unsigned long long __u64;
+typedef int __s32;
+typedef long long __s64;
+typedef __u32 pid_t;
+typedef _Bool bool;
+enum { false = 0, true = 1 };
+#endif
+EOF
           fi
           echo "BTF_OK=$BTF" >> "$GITHUB_ENV"
 
       - name: Build Sentinel-CC
-        run: make -j$(nproc)
+        run: |
+          if [ "$BTF_OK" = "true" ]; then
+            make -j$(nproc)
+          else
+            # Skip BPF object + loader (need full vmlinux.h), build everything else
+            make -j$(nproc) pass sign_tool || true
+          fi
 
       - name: Build benchmarks & attacks
         timeout-minutes: 10
@@ -59,6 +102,7 @@ jobs:
           cc -O2 eval/seccomp_harness.c -lseccomp -o eval/seccomp_harness 2>/dev/null || true
 
       - name: Setup keyring
+        if: env.BTF_OK == 'true'
         run: |
           sudo keyctl add user sentinel:pubkey "$(cat pub.pem)" @s
           sudo keyctl setperm $(keyctl search @s user sentinel:pubkey) 0x3f3f3f3f
