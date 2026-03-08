@@ -124,37 +124,170 @@ jobs:
         if: env.BTF_OK == 'true'
         run: sudo ./benchmark.sh 2>&1
 
-      - name: "Benchmark 2: Macro Benchmarks (nginx/Redis/SQLite)"
+      # ── Macro Benchmarks ──────────────────────────────────────────
+      # Each workload in its own step: isolated failures, simple process
+      # management, and timeout-minutes can actually kill everything.
+      # sudo is used ONLY for BPF loader (needs CAP_BPF).
+
+      - name: "Benchmark 2a: nginx throughput"
         if: env.BTF_OK == 'true'
         continue-on-error: true
-        timeout-minutes: 10
-        shell: bash {0}
+        timeout-minutes: 5
         run: |
-          set +e  # Don't exit on errors — we handle them ourselves
-          chmod +x benchmarks/macro_bench.sh
-          sudo systemctl stop nginx redis-server 2>/dev/null || true
-          echo "::group::Macro benchmark output"
-          # timeout OUTSIDE sudo so signals propagate from GH Actions -> timeout -> sudo -> script
-          timeout --foreground --signal=TERM --kill-after=30 540 sudo -E ./benchmarks/macro_bench.sh 3 480 2>&1
-          BENCH_EXIT=$?
-          echo "::endgroup::"
-          echo "macro_bench.sh exited with code: $BENCH_EXIT"
-          # Always clean up all possible orphans
+          mkdir -p benchmarks
+          CSV=benchmarks/results_macro.csv
+          [ -f "$CSV" ] || echo "workload,mode,mean_throughput,stddev,unit" > "$CSV"
+          sudo systemctl stop nginx 2>/dev/null || true
+          killall nginx 2>/dev/null || true
+
+          # Generate config if needed
+          if [ ! -f benchmarks/nginx_bench.conf ]; then
+            cat > benchmarks/nginx_bench.conf <<'EOF'
+          daemon off;
+          worker_processes 1;
+          pid /tmp/sentinel_nginx.pid;
+          error_log /tmp/sentinel_nginx_err.log;
+          events { worker_connections 64; }
+          http {
+            access_log off;
+            server { listen 8765; location / { return 200 "ok\n"; } }
+          }
+          EOF
+          fi
+
+          RUNS=3
+          bench_nginx() {
+            local mode=$1 results=/tmp/nginx_${mode}.txt
+            rm -f "$results"
+            for i in $(seq 1 $RUNS); do
+              echo "  nginx $mode run $i/$RUNS"
+              killall nginx 2>/dev/null || true; sleep 0.2
+              nginx -c "$(pwd)/benchmarks/nginx_bench.conf" &
+              SRV=$!
+              for w in $(seq 1 10); do bash -c "echo >/dev/tcp/127.0.0.1/8765" 2>/dev/null && break; sleep 0.2; done
+              rps=$(timeout 10 wrk -t1 -c8 -d2s http://127.0.0.1:8765/ 2>/dev/null | grep 'Requests/sec' | awk '{print $2}')
+              echo "${rps:-0}" >> "$results"
+              kill $SRV 2>/dev/null; wait $SRV 2>/dev/null || true
+              sleep 0.2
+            done
+            awk '{s+=$1;ss+=$1*$1;n++} END{m=s/n;sd=sqrt((ss/n)-(m*m));printf "%.2f %.2f\n",m,sd}' "$results"
+          }
+
+          echo "── nginx native ──"
+          NATIVE=$(bench_nginx native)
+          echo "── nginx sentinel ──"
+          sudo ./loader --system-wide ./victim_phase2 &>/dev/null &
+          LOADER=$!
+          sleep 2
+          SENTINEL=$(bench_nginx sentinel)
+          sudo kill $LOADER 2>/dev/null; sudo kill -9 $LOADER 2>/dev/null; wait $LOADER 2>/dev/null || true
           sudo pkill -9 -f './loader' 2>/dev/null || true
-          sudo pkill -9 -f 'victim_phase2' 2>/dev/null || true
-          sudo killall -9 nginx redis-server 2>/dev/null || true
-          sleep 1
-          # Verify no leftover processes
-          pgrep -af 'loader|victim|nginx|redis-server' || echo "All clean"
+
+          N_MEAN=$(echo "$NATIVE" | awk '{print $1}')
+          S_MEAN=$(echo "$SENTINEL" | awk '{print $1}')
+          N_SD=$(echo "$NATIVE" | awk '{print $2}')
+          S_SD=$(echo "$SENTINEL" | awk '{print $2}')
+          echo "nginx,native,$N_MEAN,$N_SD,req/s" >> "$CSV"
+          echo "nginx,sentinel,$S_MEAN,$S_SD,req/s" >> "$CSV"
+          echo "✓ nginx native: $N_MEAN req/s | sentinel: $S_MEAN req/s"
+          killall nginx 2>/dev/null || true
+
+      - name: "Benchmark 2b: Redis throughput"
+        if: env.BTF_OK == 'true'
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          CSV=benchmarks/results_macro.csv
+          sudo systemctl stop redis-server 2>/dev/null || true
+          killall redis-server 2>/dev/null || true
+
+          RUNS=3
+          bench_redis() {
+            local mode=$1 results=/tmp/redis_${mode}.txt
+            rm -f "$results"
+            for i in $(seq 1 $RUNS); do
+              echo "  redis $mode run $i/$RUNS"
+              killall redis-server 2>/dev/null || true; sleep 0.2
+              redis-server --port 7777 --save "" --appendonly no --loglevel warning &
+              SRV=$!
+              for w in $(seq 1 10); do bash -c "echo >/dev/tcp/127.0.0.1/7777" 2>/dev/null && break; sleep 0.2; done
+              ops=$(timeout 15 redis-benchmark -p 7777 -n 10000 -c 10 -P 8 -q 2>/dev/null | grep 'SET:' | awk '{print $2}')
+              echo "${ops:-0}" >> "$results"
+              kill $SRV 2>/dev/null; wait $SRV 2>/dev/null || true
+              sleep 0.2
+            done
+            awk '{s+=$1;ss+=$1*$1;n++} END{m=s/n;sd=sqrt((ss/n)-(m*m));printf "%.2f %.2f\n",m,sd}' "$results"
+          }
+
+          echo "── Redis native ──"
+          NATIVE=$(bench_redis native)
+          echo "── Redis sentinel ──"
+          sudo ./loader --system-wide ./victim_phase2 &>/dev/null &
+          LOADER=$!
+          sleep 2
+          SENTINEL=$(bench_redis sentinel)
+          sudo kill $LOADER 2>/dev/null; sudo kill -9 $LOADER 2>/dev/null; wait $LOADER 2>/dev/null || true
+          sudo pkill -9 -f './loader' 2>/dev/null || true
+
+          N_MEAN=$(echo "$NATIVE" | awk '{print $1}')
+          S_MEAN=$(echo "$SENTINEL" | awk '{print $1}')
+          N_SD=$(echo "$NATIVE" | awk '{print $2}')
+          S_SD=$(echo "$SENTINEL" | awk '{print $2}')
+          echo "redis,native,$N_MEAN,$N_SD,ops/s" >> "$CSV"
+          echo "redis,sentinel,$S_MEAN,$S_SD,ops/s" >> "$CSV"
+          echo "✓ Redis native: $N_MEAN ops/s | sentinel: $S_MEAN ops/s"
+          killall redis-server 2>/dev/null || true
+
+      - name: "Benchmark 2c: SQLite throughput"
+        if: env.BTF_OK == 'true'
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          CSV=benchmarks/results_macro.csv
+          if [ ! -x ./benchmarks/sqlite_bench ]; then
+            echo "::warning::sqlite_bench not found, skipping"
+            exit 0
+          fi
+
+          RUNS=3
+          echo "── SQLite native ──"
+          NATIVE_FILE=/tmp/sqlite_native.txt; rm -f "$NATIVE_FILE"
+          for i in $(seq 1 $RUNS); do
+            echo "  sqlite native run $i/$RUNS"
+            rm -f /tmp/sentinel_bench.db
+            ops=$(./benchmarks/sqlite_bench /tmp/sentinel_bench.db 2>&1 | grep 'SQLITE_OPS_PER_SEC=' | cut -d= -f2)
+            echo "${ops:-0}" >> "$NATIVE_FILE"
+          done
+
+          echo "── SQLite sentinel ──"
+          SENTINEL_FILE=/tmp/sqlite_sentinel.txt; rm -f "$SENTINEL_FILE"
+          for i in $(seq 1 $RUNS); do
+            echo "  sqlite sentinel run $i/$RUNS"
+            rm -f /tmp/sentinel_bench.db
+            output=$(timeout 30 sudo ./loader ./benchmarks/sqlite_bench /tmp/sentinel_bench.db 2>&1) || true
+            ops=$(echo "$output" | grep 'SQLITE_OPS_PER_SEC=' | cut -d= -f2)
+            if [ -z "$ops" ] || [ "$ops" = "0" ]; then
+              echo "  (loader+sqlite_bench yielded 0, skipping remaining sentinel runs)"
+              echo "0" >> "$SENTINEL_FILE"
+              break
+            fi
+            echo "${ops:-0}" >> "$SENTINEL_FILE"
+          done
+
+          NATIVE=$(awk '{s+=$1;ss+=$1*$1;n++} END{m=s/n;sd=sqrt((ss/n)-(m*m));printf "%.2f %.2f\n",m,sd}' "$NATIVE_FILE")
+          SENTINEL=$(awk '{s+=$1;ss+=$1*$1;n++} END{m=s/n;sd=sqrt((ss/n)-(m*m));printf "%.2f %.2f\n",m,sd}' "$SENTINEL_FILE")
+          echo "sqlite,native,$(echo $NATIVE | awk '{print $1}'),$(echo $NATIVE | awk '{print $2}'),ops/s" >> "$CSV"
+          echo "sqlite,sentinel,$(echo $SENTINEL | awk '{print $1}'),$(echo $SENTINEL | awk '{print $2}'),ops/s" >> "$CSV"
+          echo "✓ SQLite native: $(echo $NATIVE | awk '{print $1}') ops/s | sentinel: $(echo $SENTINEL | awk '{print $1}') ops/s"
+          sudo pkill -9 -f './loader' 2>/dev/null || true
 
       - name: "Benchmark 3: Comparative Evaluation"
         if: env.BTF_OK == 'true'
         continue-on-error: true
-        timeout-minutes: 8
+        timeout-minutes: 6
         run: |
           chmod +x eval/comparative.sh
-          # timeout OUTSIDE sudo so signals propagate properly
-          timeout --foreground --signal=TERM --kill-after=30 360 sudo -E ./eval/comparative.sh 100000 3 2>&1 || true
+          sudo ./eval/comparative.sh 100000 3 2>&1 || true
           sudo pkill -9 -f './loader' 2>/dev/null || true
           sudo pkill -9 -f 'victim' 2>/dev/null || true
 
