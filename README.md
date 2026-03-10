@@ -175,6 +175,7 @@ sudo scc bench              # Run latency benchmarks
 sudo scc test               # Full test suite
 scc features                # Show all features
 scc dump ./victim           # Inspect embedded policy
+scc sign --fingerprint pub.pem # Show public key fingerprint
 ```
 
 ### Manual Build & Run
@@ -192,6 +193,11 @@ Sentinel respects the Linux Kernel Keyring. You must load the public key into yo
 ```bash
 # In production, this would be a builtin_trusted_key
 sudo keyctl add user sentinel:pubkey "$(cat pub.pem)" @s
+
+# --- OR: Use TPM2-backed Root of Trust ---
+# Load key from TPM2/PKCS#11 URI (requires tpm2-tss-engine)
+# export SENTINEL_TPM_URI="pkcs11:token=sentinel;object=pubkey;type=public"
+sudo ./loader --tpm ./victim
 ```
 
 ### 3. Run the Enforcer
@@ -317,6 +323,21 @@ Inspect the embedded Sentinel sections of any instrumented binary:
 ── .signature ──────────────────────────────────────────────────
   Size: 64 bytes (Ed25519)
   Status: SIGNED
+```
+
+### Binary Signing & Revocation (`sentinel-sign`)
+
+The signing tool supports advanced key management and revocation:
+
+```bash
+# Sign a binary
+./sentinel-sign ./victim priv.pem
+
+# Get public key fingerprint
+./sentinel-sign --fingerprint pub.pem
+
+# Revoke a key (adds to /etc/sentinel/policy.crl)
+sudo ./sentinel-sign --revoke pub.pem "Compromised"
 ```
 
 JSON output for tooling integration:
@@ -582,15 +603,13 @@ sudo ./loader --audit ./victim      # Any test with audit output
 ## Project Status
 
 > [!TIP]
-> **Current Status: v4.4.0 — Learning Mode, Shadow Stack CFI, System-Wide Enforcement**
+> **Current Status: v4.5.0 — TPM2 Root of Trust, Signing Revocation, System-Wide Enforcement**
 > * **Phase 1:** Static Binary Enforcement with Cryptographic Binding.
 > * **Phase 2:** Full Real-World Runtime Security (ASLR, Shared Libs, CFI, Multithreading).
 > * **Phase 3:** Syscall Number Binding + Fork Tracking + Ed25519 Migration.
-> * **v4.0.0:** Per-app call-graph libc filtering (**81.6% attack surface reduction** measured), generalized CFI from `.sentinel_cfi`, obfuscated syscall detection, 16 hook points, key rotation/revocation, system-wide install.
-> * **v4.1.0:** JSON audit format with ISO-8601 timestamps, syslog integration (LOG_DAEMON), `sentinel-dump` policy inspector (text + JSON), systemd template service unit, man pages for all tools.
-> * **v4.2.0:** fexit post-syscall hooks (5 return-value probes), SIGHUP policy hot-reload, LD_PRELOAD/LD_AUDIT/LD_LIBRARY_PATH sanitization, `sentinel-tui` terminal dashboard, ARM64 cross-compilation CI tier.
-> * **v4.3.0:** Configurable enforcement modes (kill/permissive/term), runtime `dlopen()` monitoring with dynamic policy extension, cgroup-scoped enforcement for container deployments, policy format versioning.
-> * **v4.4.0:** Full dependency call-graph filtering for ALL shared libraries, runtime policy learning mode (`--learn`), shadow stack CFI validation (`--shadow-cfi`), system-wide fallback enforcement (`--system-wide`), kernel attack surface reporting (`--surface`), per-thread syscall policies, dynamic library load enforcement via `lib_allow_map`, 11 BPF maps, 7 global config vars.
+> * **v4.0.0 - v4.3.0:** Per-app call-graph filtering, JSON audit, systemd integration, dlopen monitoring, cgroup scoping.
+> * **v4.4.0:** Full dependency call-graph filtering, Learning Mode, Shadow Stack CFI, System-Wide Fallback.
+> * **v4.5.0:** TPM2-backed Root of Trust support via OpenSSL STORE API, enhanced `sentinel-sign` with `--revoke` and `--fingerprint` commands, formal CRL support (`/etc/sentinel/policy.crl`).
 > * **Performance:** 274 ns/syscall overhead (48.58%) — within wire-speed threshold. Real HTTP server: ~0.7 ms/request under full enforcement (44 sites, 0 violations).
 > * **Security:** 12/12 red-team attacks blocked + fork tracking. 3 unconditional-block hooks (ptrace, process_vm_writev, seccomp).
 > 

@@ -105,6 +105,11 @@ ${BOLD}LOADER OPTIONS${NC} (for run/ui commands)
   --enforce=kill|permissive|term  Set enforcement mode (default: kill)
   --watch-dlopen            Monitor for dlopen'd libraries at runtime
   --cgroup=PATH             Restrict enforcement to a cgroup
+  --learn                   Learning mode: record syscall profile
+  --shadow-cfi              Enable shadow stack CFI validation
+  --system-wide             Enforce fallback for ALL processes
+  --surface                 Print attack surface report and exit
+  --tpm                     Use TPM2 Root of Trust for verification
 
 ${DIM}https://github.com/nevinshine/sentinel-cc${NC}
 EOF
