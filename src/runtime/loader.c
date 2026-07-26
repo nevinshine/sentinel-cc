@@ -12,18 +12,12 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <gelf.h>
-#include <keyutils.h>
 #include <libelf.h>
 #include <limits.h>
-#include <openssl/err.h>
-#include <openssl/evp.h>
-#include <openssl/pem.h>
-#include <openssl/store.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <syslog.h>
 #include <sys/ptrace.h>
 #include <sys/stat.h>
 #include <sys/user.h>
@@ -57,16 +51,7 @@ static struct sentinel_bpf *g_skel = NULL;
 static pid_t g_child = -1;
 static volatile sig_atomic_t g_shutdown = 0;
 static volatile sig_atomic_t g_reload = 0;
-static enum audit_format g_audit_fmt = AUDIT_FMT_TEXT;
-static enum audit_target g_audit_tgt = AUDIT_TGT_STDOUT;
 static int g_enforce_mode = ENFORCE_KILL; // default: fail-closed
-static int g_watch_dlopen = 0; // 1 = periodically re-scan /proc/maps for new libs
-static char g_cgroup_path[512] = {0}; // cgroup v2 path for container scoping
-static int g_learn_mode = 0;     // 1 = learning mode (record, not enforce)
-static int g_shadow_cfi = 0;     // 1 = shadow stack CFI validation
-static int g_system_wide = 0;    // 1 = enforce fallback for ALL processes
-static int g_surface_report = 0; // 1 = print attack surface map and exit
-static int g_use_tpm = 0;        // 1 = verify signature via TPM-backed key
 
 // =============================================================================
 // Signal Handler — graceful cleanup
@@ -105,243 +90,14 @@ static void install_signal_handlers(void) {
 // =============================================================================
 // OpenSSL Error Handler
 // =============================================================================
-static void handle_openssl_error(const char *context) {
-  fprintf(stderr, "[FATAL] OpenSSL error in %s:\n", context);
-  ERR_print_errors_fp(stderr);
-  exit(1);
-}
 
 // Forward declaration (defined after libc call-graph infrastructure)
-static int is_key_revoked(EVP_PKEY *pub);
-
-// =============================================================================
-// TPM2 Key Loading via OpenSSL STORE API (tpm2-tss-engine/pkcs11)
-// Uses OSSL_STORE_open() to load public key from a PKCS#11 or TPM2 URI.
-// Requires tpm2-tss-engine or pkcs11 provider installed on the system.
-// =============================================================================
-#define TPM2_DEFAULT_URI "pkcs11:token=sentinel;object=pubkey;type=public"
-
-static EVP_PKEY *load_tpm2_pubkey(void) {
-  const char *uri = getenv("SENTINEL_TPM_URI");
-  if (!uri)
-    uri = TPM2_DEFAULT_URI;
-
-  OSSL_STORE_CTX *store = OSSL_STORE_open(uri, NULL, NULL, NULL, NULL);
-  if (!store) {
-    fprintf(stderr, "[FATAL] TPM2: Cannot open PKCS#11 store URI: %s\n", uri);
-    ERR_print_errors_fp(stderr);
-    return NULL;
-  }
-
-  EVP_PKEY *pkey = NULL;
-  while (!OSSL_STORE_eof(store)) {
-    OSSL_STORE_INFO *info = OSSL_STORE_load(store);
-    if (!info)
-      continue;
-    int type = OSSL_STORE_INFO_get_type(info);
-    if (type == OSSL_STORE_INFO_PKEY) {
-      pkey = OSSL_STORE_INFO_get1_PKEY(info);
-      OSSL_STORE_INFO_free(info);
-      break;
-    }
-    OSSL_STORE_INFO_free(info);
-  }
-  OSSL_STORE_close(store);
-
-  if (!pkey)
-    fprintf(stderr, "[FATAL] TPM2: No public key found at URI: %s\n", uri);
-  else
-    printf("[Loader] TPM2: Loaded public key from %s\n", uri);
-  return pkey;
-}
 
 // =============================================================================
 // Verify Binary Signature via Kernel Keyring
 // Returns the verified open fd on success (caller must close), or -1 on error.
 // Keeping the fd open prevents TOCTOU — caller can fexecve() from this fd.
 // =============================================================================
-static int verify_signature(const char *binary_path) {
-  int ret = -1;
-  int fd = -1;
-  Elf *e = NULL;
-  EVP_PKEY *pub = NULL;
-  EVP_MD_CTX *mdctx = NULL;
-  char *keybuf = NULL;
-  BIO *bio = NULL;
-
-  if (elf_version(EV_CURRENT) == EV_NONE) {
-    fprintf(stderr, "[FATAL] ELF library init failed: %s\n", elf_errmsg(-1));
-    goto out;
-  }
-
-  fd = open(binary_path, O_RDONLY);
-  if (fd < 0) {
-    perror("[FATAL] open binary");
-    goto out;
-  }
-
-  e = elf_begin(fd, ELF_C_READ, NULL);
-  if (!e) {
-    fprintf(stderr, "[FATAL] elf_begin: %s\n", elf_errmsg(-1));
-    goto out;
-  }
-
-  size_t shstrndx;
-  if (elf_getshdrstrndx(e, &shstrndx) != 0) {
-    fprintf(stderr, "[FATAL] Cannot get section string table.\n");
-    goto out;
-  }
-
-  Elf_Scn *scn = NULL;
-  Elf_Data *text = NULL, *sentinel = NULL, *sig = NULL;
-  Elf_Data *sentinel_imports = NULL, *sentinel_cfi = NULL;
-  GElf_Shdr shdr;
-
-  while ((scn = elf_nextscn(e, scn)) != NULL) {
-    gelf_getshdr(scn, &shdr);
-    char *name = elf_strptr(e, shstrndx, shdr.sh_name);
-    if (!name)
-      continue;
-    if (strcmp(name, ".text") == 0)
-      text = elf_getdata(scn, NULL);
-    else if (strcmp(name, ".sentinel") == 0)
-      sentinel = elf_getdata(scn, NULL);
-    else if (strcmp(name, ".signature") == 0)
-      sig = elf_getdata(scn, NULL);
-    else if (strcmp(name, ".sentinel_imports") == 0)
-      sentinel_imports = elf_getdata(scn, NULL);
-    else if (strcmp(name, ".sentinel_cfi") == 0)
-      sentinel_cfi = elf_getdata(scn, NULL);
-  }
-
-  if (!text || !sentinel || !sig) {
-    fprintf(stderr, "[FATAL] Missing security sections (.text=%p .sentinel=%p "
-                    ".signature=%p)\n",
-            (void *)text, (void *)sentinel, (void *)sig);
-    goto out;
-  }
-
-  // Load Public Key — from TPM2 or from Kernel Keyring
-  if (g_use_tpm) {
-    pub = load_tpm2_pubkey();
-    if (!pub)
-      goto out;
-  } else {
-  // Load Public Key from Session Keyring
-  key_serial_t key_id =
-      keyctl_search(KEY_SPEC_SESSION_KEYRING, "user", "sentinel:pubkey", 0);
-  if (key_id == -1) {
-    // Fallback: try user keyring
-    key_id = keyctl_search(KEY_SPEC_USER_KEYRING, "user", "sentinel:pubkey", 0);
-  }
-  if (key_id == -1) {
-    fprintf(stderr,
-            "[FATAL] Key 'sentinel:pubkey' not found in any keyring.\n"
-            "  Add it with: keyctl add user sentinel:pubkey \"$(cat pub.pem)\" @s\n");
-    goto out;
-  }
-
-  long klen = keyctl_read(key_id, NULL, 0);
-  if (klen <= 0) {
-    perror("[FATAL] keyctl_read size");
-    goto out;
-  }
-
-  keybuf = malloc(klen);
-  if (!keybuf) {
-    perror("[FATAL] malloc");
-    goto out;
-  }
-
-  long read_len = keyctl_read(key_id, keybuf, klen);
-  if (read_len != klen) {
-    fprintf(stderr, "[FATAL] Key read incomplete (%ld/%ld).\n", read_len, klen);
-    goto out;
-  }
-
-  bio = BIO_new_mem_buf(keybuf, klen);
-  pub = PEM_read_bio_PUBKEY(bio, NULL, NULL, NULL);
-  if (!pub)
-    handle_openssl_error("PEM_read_bio_PUBKEY");
-  } // end keyring path
-
-  // Key revocation check
-  if (is_key_revoked(pub)) {
-    fprintf(stderr, "[FATAL] Refusing to accept signature from revoked key.\n");
-    goto out;
-  }
-
-  mdctx = EVP_MD_CTX_new();
-  if (!mdctx)
-    handle_openssl_error("EVP_MD_CTX_new");
-
-  // Compute SHA-256(.text + .sentinel [+ .sentinel_cfi] [+ .sentinel_imports])
-  // Both sign_tool and loader use the same section order.
-  unsigned char hash[32];
-  {
-    EVP_MD_CTX *hash_ctx = EVP_MD_CTX_new();
-    if (!hash_ctx)
-      handle_openssl_error("EVP_MD_CTX_new (hash)");
-    unsigned int hash_len = 0;
-    if (EVP_DigestInit_ex(hash_ctx, EVP_sha256(), NULL) <= 0 ||
-        EVP_DigestUpdate(hash_ctx, text->d_buf, text->d_size) <= 0 ||
-        EVP_DigestUpdate(hash_ctx, sentinel->d_buf, sentinel->d_size) <= 0) {
-      EVP_MD_CTX_free(hash_ctx);
-      handle_openssl_error("SHA-256 hash (base)");
-    }
-    // Include .sentinel_cfi if present (alphabetical order)
-    if (sentinel_cfi && sentinel_cfi->d_buf && sentinel_cfi->d_size > 0) {
-      if (EVP_DigestUpdate(hash_ctx, sentinel_cfi->d_buf,
-                           sentinel_cfi->d_size) <= 0) {
-        EVP_MD_CTX_free(hash_ctx);
-        handle_openssl_error("SHA-256 hash (.sentinel_cfi)");
-      }
-    }
-    // Include .sentinel_imports if present
-    if (sentinel_imports && sentinel_imports->d_buf &&
-        sentinel_imports->d_size > 0) {
-      if (EVP_DigestUpdate(hash_ctx, sentinel_imports->d_buf,
-                           sentinel_imports->d_size) <= 0) {
-        EVP_MD_CTX_free(hash_ctx);
-        handle_openssl_error("SHA-256 hash (.sentinel_imports)");
-      }
-    }
-    if (EVP_DigestFinal_ex(hash_ctx, hash, &hash_len) <= 0) {
-      EVP_MD_CTX_free(hash_ctx);
-      handle_openssl_error("SHA-256 hash (final)");
-    }
-    EVP_MD_CTX_free(hash_ctx);
-  }
-
-  // Ed25519: NULL digest — algorithm has its own internal hash
-  if (EVP_DigestVerifyInit(mdctx, NULL, NULL, NULL, pub) <= 0)
-    handle_openssl_error("DigestVerifyInit");
-
-  // Ed25519 single-shot verify
-  ret = EVP_DigestVerify(mdctx, sig->d_buf, sig->d_size, hash, sizeof(hash));
-
-out:
-  if (mdctx)
-    EVP_MD_CTX_free(mdctx);
-  if (pub)
-    EVP_PKEY_free(pub);
-  if (bio)
-    BIO_free(bio);
-  free(keybuf);
-  if (e)
-    elf_end(e);
-
-  if (ret == 1) {
-    printf("[Loader] Signature Verified. Integrity Confirmed.\n");
-    return fd;  // Return verified fd — caller uses fexecve()
-  } else {
-    if (fd >= 0)
-      close(fd);
-    fprintf(stderr,
-            "[FATAL] Signature Verification FAILED! Binary may be tampered.\n");
-    return -1;
-  }
-}
 
 // =============================================================================
 // Parse .sentinel section — extract policy offsets from the binary itself
@@ -830,68 +586,6 @@ static uint8_t *get_bytes_at(struct exec_section *secs, int nsecs,
 // Parse .sentinel_imports from binary ELF.
 // Returns number of imports found; fills imports[] with pointers into blob.
 // Caller must free(*blob).
-static int parse_sentinel_imports(const char *binary_path,
-                                  char ***imports_out, char **blob_out) {
-  int fd = -1, count = 0;
-  Elf *e = NULL;
-  *imports_out = NULL;
-  *blob_out = NULL;
-
-  if (elf_version(EV_CURRENT) == EV_NONE) return 0;
-  fd = open(binary_path, O_RDONLY);
-  if (fd < 0) return 0;
-  e = elf_begin(fd, ELF_C_READ, NULL);
-  if (!e) { close(fd); return 0; }
-
-  size_t shstrndx;
-  if (elf_getshdrstrndx(e, &shstrndx) != 0) goto out;
-
-  Elf_Scn *scn = NULL;
-  GElf_Shdr shdr;
-  while ((scn = elf_nextscn(e, scn)) != NULL) {
-    gelf_getshdr(scn, &shdr);
-    char *name = elf_strptr(e, shstrndx, shdr.sh_name);
-    if (name && strcmp(name, ".sentinel_imports") == 0) {
-      Elf_Data *data = elf_getdata(scn, NULL);
-      if (!data || !data->d_buf || data->d_size == 0) break;
-
-      // Copy blob
-      char *blob = malloc(data->d_size);
-      if (!blob) break;
-      memcpy(blob, data->d_buf, data->d_size);
-
-      // Count null-terminated strings
-      int n = 0;
-      for (size_t i = 0; i < data->d_size; i++) {
-        if (blob[i] == '\0') n++;
-      }
-      char **arr = calloc(n, sizeof(char *));
-      if (!arr) { free(blob); break; }
-
-      int idx = 0;
-      char *p = blob;
-      char *end = blob + data->d_size;
-      while (p < end && idx < n) {
-        if (*p != '\0') {
-          arr[idx++] = p;
-          p += strlen(p) + 1;
-        } else {
-          p++;
-        }
-      }
-
-      *blob_out = blob;
-      *imports_out = arr;
-      count = idx;
-      break;
-    }
-  }
-
-out:
-  if (e) elf_end(e);
-  if (fd >= 0) close(fd);
-  return count;
-}
 
 // Parse .sentinel_cfi section: array of {site_addr, func_addr} pairs.
 // Caller uses this + ELF symtab to set up per-site CFI ranges.
@@ -1101,108 +795,6 @@ static int trace_libc_callgraph(const char *libc_path,
 // Seeds from the library's .dynsym exports that match the binary's imports.
 // Returns syscall site offsets (ELF-relative) reachable via BFS.
 // =============================================================================
-static int trace_lib_callgraph(const char *lib_path,
-                               char **app_imports, int nimports,
-                               uint64_t *syscall_sites_out, int max_sites,
-                               int *reachable_count_out) {
-  // Build symbol table for this library
-  struct libc_sym_entry *syms = calloc(MAX_LIBC_SYMS, sizeof(*syms));
-  if (!syms) return 0;
-  int nsyms = build_libc_symtab(lib_path, syms, MAX_LIBC_SYMS);
-  if (nsyms == 0) { free(syms); return 0; }
-
-  // Load executable sections
-  struct exec_section sections[16];
-  int nsecs = load_exec_sections(lib_path, sections, 16);
-  if (nsecs == 0) { free(syms); return 0; }
-
-  int *queue = calloc(MAX_REACHABLE, sizeof(int));
-  uint8_t *visited = calloc(nsyms, sizeof(uint8_t));
-  if (!queue || !visited) {
-    free(queue); free(visited); free(syms);
-    free_exec_sections(sections, nsecs);
-    return 0;
-  }
-
-  int q_head = 0, q_tail = 0;
-
-  // Seed: for each of the binary's imports, check if this library exports it
-  for (int i = 0; i < nimports && q_tail < MAX_REACHABLE; i++) {
-    struct libc_sym_entry *sym = find_sym_by_name(syms, nsyms, app_imports[i]);
-    if (!sym) continue;
-    int idx = sym - syms;
-    if (!visited[idx]) {
-      visited[idx] = 1;
-      queue[q_tail++] = idx;
-    }
-  }
-
-  // Also seed internal variants (__GI_, __, _nostatus, _nocancel)
-  for (int i = 0; i < nimports; i++) {
-    const char *imp = app_imports[i];
-    const char *base = imp;
-    while (*base == '_') base++;
-    int base_len = strlen(base);
-    if (base_len < 2) continue;
-    for (int s = 0; s < nsyms && q_tail < MAX_REACHABLE; s++) {
-      if (visited[s]) continue;
-      const char *sn = syms[s].name;
-      if (strstr(sn, base) &&
-          (strncmp(sn, "__", 2) == 0 || strncmp(sn, base, base_len) == 0)) {
-        visited[s] = 1;
-        queue[q_tail++] = s;
-      }
-    }
-  }
-
-  // BFS depth-limited traversal
-  int depth_boundary = q_tail, current_depth = 0;
-  while (q_head < q_tail && current_depth < CALLGRAPH_DEPTH_LIMIT) {
-    int sym_idx = queue[q_head++];
-    struct libc_sym_entry *sym = &syms[sym_idx];
-    if (q_head > depth_boundary) {
-      current_depth++;
-      depth_boundary = q_tail;
-    }
-    size_t avail = 0;
-    uint8_t *bytes = get_bytes_at(sections, nsecs, sym->addr, sym->size, &avail);
-    if (!bytes || avail < 5) continue;
-    for (size_t j = 0; j + 4 < avail; j++) {
-      if (bytes[j] != 0xE8 && bytes[j] != 0xE9) continue;
-      int32_t disp;
-      memcpy(&disp, &bytes[j + 1], 4);
-      uint64_t target = sym->addr + j + 5 + (int64_t)disp;
-      struct libc_sym_entry *callee = find_sym_at_addr(syms, nsyms, target);
-      if (!callee) continue;
-      int callee_idx = callee - syms;
-      if (!visited[callee_idx] && q_tail < MAX_REACHABLE) {
-        visited[callee_idx] = 1;
-        queue[q_tail++] = callee_idx;
-      }
-    }
-  }
-
-  *reachable_count_out = q_tail;
-
-  // Collect syscall sites from reachable functions
-  int nsites = 0;
-  for (int i = 0; i < q_tail && nsites < max_sites; i++) {
-    struct libc_sym_entry *sym = &syms[queue[i]];
-    size_t avail = 0;
-    uint8_t *bytes = get_bytes_at(sections, nsecs, sym->addr, sym->size, &avail);
-    if (!bytes) continue;
-    for (size_t j = 0; j + 1 < avail && nsites < max_sites; j++) {
-      if (bytes[j] == 0x0f && bytes[j + 1] == 0x05)
-        syscall_sites_out[nsites++] = sym->addr + j;
-    }
-  }
-
-  free(queue);
-  free(visited);
-  free(syms);
-  free_exec_sections(sections, nsecs);
-  return nsites;
-}
 
 // =============================================================================
 // Key Revocation: Check if the current public key is revoked
@@ -1212,103 +804,7 @@ static int trace_lib_callgraph(const char *lib_path,
 // =============================================================================
 
 // Parse a CRL file and check if the given fingerprint is listed
-static int check_crl_file(const char *crl_path, const char *fp_hex) {
-  FILE *cfp = fopen(crl_path, "r");
-  if (!cfp) return 0;
 
-  char line[512];
-  int version_ok = 0;
-  time_t crl_timestamp = 0;
-
-  while (fgets(line, sizeof(line), cfp)) {
-    char *nl = strchr(line, '\n');
-    if (nl) *nl = '\0';
-    if (line[0] == '#' || line[0] == '\0') continue;
-
-    if (strncmp(line, "VERSION ", 8) == 0) {
-      int ver = atoi(line + 8);
-      if (ver != 1) {
-        fprintf(stderr, "[WARN] Unknown CRL version %d in %s\n", ver, crl_path);
-        fclose(cfp);
-        return 0;
-      }
-      version_ok = 1;
-      continue;
-    }
-    if (strncmp(line, "TIMESTAMP ", 10) == 0) {
-      crl_timestamp = (time_t)strtol(line + 10, NULL, 10);
-      // Reject CRL older than 30 days
-      time_t now = time(NULL);
-      if (now - crl_timestamp > 30 * 86400) {
-        fprintf(stderr, "[WARN] CRL expired (>30 days old) in %s\n", crl_path);
-        fclose(cfp);
-        return 0; // Expired CRL = not trustworthy
-      }
-      continue;
-    }
-    if (strncmp(line, "REVOKE ", 7) == 0 && version_ok) {
-      // Format: REVOKE <64-char hex fingerprint> <reason>
-      if (strncmp(line + 7, fp_hex, 64) == 0) {
-        const char *reason = (strlen(line) > 71) ? line + 72 : "unspecified";
-        fprintf(stderr,
-                "[FATAL] Key REVOKED via CRL (reason: %s, fingerprint: %.16s...)\n",
-                reason, fp_hex);
-        fclose(cfp);
-        return 1;
-      }
-    }
-  }
-  fclose(cfp);
-  return 0;
-}
-
-static int is_key_revoked(EVP_PKEY *pub) {
-  // Compute SHA-256 fingerprint of the public key DER encoding
-  unsigned char *der = NULL;
-  int der_len = i2d_PUBKEY(pub, &der);
-  if (der_len <= 0) return 0; // Can't check — allow
-
-  unsigned char fp[32];
-  unsigned int fp_len = 0;
-  EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-  if (!ctx) { OPENSSL_free(der); return 0; }
-  EVP_DigestInit_ex(ctx, EVP_sha256(), NULL);
-  EVP_DigestUpdate(ctx, der, der_len);
-  EVP_DigestFinal_ex(ctx, fp, &fp_len);
-  EVP_MD_CTX_free(ctx);
-  OPENSSL_free(der);
-
-  // Convert to hex string
-  char fp_hex[65];
-  for (unsigned int i = 0; i < fp_len; i++)
-    snprintf(fp_hex + i * 2, 3, "%02x", fp[i]);
-  fp_hex[64] = '\0';
-
-  // 1. Check legacy flat-file revocation list
-  FILE *rfp = fopen("/etc/sentinel/revoked_keys", "r");
-  if (rfp) {
-    char line[256];
-    while (fgets(line, sizeof(line), rfp)) {
-      char *nl = strchr(line, '\n');
-      if (nl) *nl = '\0';
-      if (line[0] == '#' || line[0] == '\0') continue;
-      if (strncmp(line, fp_hex, 64) == 0) {
-        fclose(rfp);
-        fprintf(stderr,
-                "[FATAL] Public key is REVOKED (fingerprint: %.16s...)\n",
-                fp_hex);
-        return 1;
-      }
-    }
-    fclose(rfp);
-  }
-
-  // 2. Check structured CRL file (with version, timestamp, reasons)
-  if (check_crl_file("/etc/sentinel/policy.crl", fp_hex))
-    return 1;
-
-  return 0;
-}
 
 // =============================================================================
 // Check if libc is loaded yet
@@ -1498,93 +994,18 @@ static const char *action_str(uint8_t action) {
   case EVENT_CFI_OK:      return "ALLOW+CFI";
   case EVENT_CFI_FAIL:    return "CFI-FAIL";
   case EVENT_NR_MISMATCH: return "NR-MISMATCH";
-  case EVENT_FORK_TRACK:  return "FORK-TRACK";
-  case EVENT_FEXIT_OK:    return "FEXIT";
-  case EVENT_DLOPEN_EXT:  return "DLOPEN-EXT";
-  case EVENT_PERMISSIVE:  return "PERMISSIVE";
-  case EVENT_LEARN:       return "LEARN";
-  case EVENT_LIB_DENY:    return "LIB-DENY";
-  case EVENT_SHADOW_OK:   return "SHADOW-OK";
-  case EVENT_SHADOW_FAIL: return "SHADOW-FAIL";
-  case EVENT_FALLBACK:    return "FALLBACK";
-  case EVENT_KOBJ_DENY:   return "KOBJ-DENY";
-  default:                return "UNKNOWN";
+  case EVENT_FORK_TRACK:  return "FORK-TRACK";  default:                return "UNKNOWN";
   }
 }
 
 static int audit_event_handler(void *ctx, void *data, size_t data_sz) {
-  (void)ctx;
   if (data_sz < sizeof(struct audit_event))
     return 0;
-  struct audit_event *evt = data;
-  const char *action = action_str(evt->action);
-
-  if (g_audit_fmt == AUDIT_FMT_JSON) {
-    // ISO-8601 timestamp from monotonic ns (approximate wall clock)
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    struct tm tm;
-    gmtime_r(&ts.tv_sec, &tm);
-    char tbuf[32];
-    strftime(tbuf, sizeof(tbuf), "%Y-%m-%dT%H:%M:%S", &tm);
-
-    char json[512];
-    int n;
-    if (evt->action == EVENT_FEXIT_OK) {
-      n = snprintf(json, sizeof(json),
-        "{\"ts\":\"%s.%03ldZ\",\"action\":\"%s\","
-        "\"pid\":%u,\"tid\":%u,\"syscall_nr\":%u,"
-        "\"ret\":%ld}",
-        tbuf, ts.tv_nsec / 1000000, action,
-        evt->tgid, evt->tid, evt->syscall_nr,
-        (long)evt->offset);
-    } else {
-      n = snprintf(json, sizeof(json),
-        "{\"ts\":\"%s.%03ldZ\",\"action\":\"%s\","
-        "\"pid\":%u,\"tid\":%u,\"syscall_nr\":%u,"
-        "\"rip\":\"0x%lx\",\"offset\":\"0x%lx\",\"module\":%u}",
-        tbuf, ts.tv_nsec / 1000000, action,
-        evt->tgid, evt->tid, evt->syscall_nr,
-        (unsigned long)evt->syscall_rip, (unsigned long)evt->offset,
-        evt->module_id);
-    }
-    if (n < 0 || (size_t)n >= sizeof(json))
-      return 0;
-
-    if (g_audit_tgt == AUDIT_TGT_SYSLOG) {
-      int prio = (evt->action == EVENT_BLOCK || evt->action == EVENT_CFI_FAIL
-                  || evt->action == EVENT_NR_MISMATCH)
-                 ? LOG_WARNING : LOG_INFO;
-      syslog(prio, "%s", json);
-    } else {
-      printf("%s\n", json);
-    }
-  } else {
-    // Original text format
-    if (evt->action == EVENT_FEXIT_OK) {
-      if (g_audit_tgt == AUDIT_TGT_SYSLOG)
-        syslog(LOG_INFO, "%s PID=%u TID=%u SYS=%u RET=%ld",
-               action, evt->tgid, evt->tid, evt->syscall_nr,
-               (long)evt->offset);
-      else
-        printf("[Audit] %s PID=%u TID=%u SYS=%u RET=%ld\n",
-               action, evt->tgid, evt->tid, evt->syscall_nr,
-               (long)evt->offset);
-    } else if (g_audit_tgt == AUDIT_TGT_SYSLOG) {
-      int prio = (evt->action == EVENT_BLOCK || evt->action == EVENT_CFI_FAIL
-                  || evt->action == EVENT_NR_MISMATCH)
-                 ? LOG_WARNING : LOG_INFO;
-      syslog(prio, "%s PID=%u TID=%u SYS=%u RIP=0x%lx Off=0x%lx Mod=%u",
-             action, evt->tgid, evt->tid, evt->syscall_nr,
-             (unsigned long)evt->syscall_rip, (unsigned long)evt->offset,
-             evt->module_id);
-    } else {
-      printf("[Audit] %s PID=%u TID=%u SYS=%u RIP=0x%lx Off=0x%lx Mod=%u\n",
-             action, evt->tgid, evt->tid, evt->syscall_nr,
-             (unsigned long)evt->syscall_rip, (unsigned long)evt->offset,
-             evt->module_id);
-    }
-  }
+  struct audit_event *evt = (struct audit_event *)data;
+  printf("[%s] TID=%u SYS=%u Off=0x%lx Mod=%u\n",
+         action_str(evt->action), evt->tid, evt->syscall_nr,
+         evt->offset, evt->module_id);
+  fflush(stdout);
   return 0;
 }
 
@@ -1606,244 +1027,21 @@ struct watched_lib {
 static struct watched_lib g_watched_libs[MAX_WATCHED_LIBS];
 static int g_n_watched_libs = 0;
 
-static int is_lib_watched(const char *path) {
-  for (int i = 0; i < g_n_watched_libs; i++) {
-    if (strcmp(g_watched_libs[i].path, path) == 0)
-      return 1;
-  }
-  return 0;
-}
 
 // FNV-1a hash for library path identity
-static uint64_t fnv1a_hash(const char *s) {
-  uint64_t h = 0xcbf29ce484222325ULL;
-  for (; *s; s++) {
-    h ^= (uint64_t)(unsigned char)*s;
-    h *= 0x100000001b3ULL;
-  }
-  return h;
-}
 
 // Set per-thread syscall NR restriction in BPF thread_policy_map
-static int set_thread_policy(uint32_t tgid, uint32_t tid,
-                             uint32_t max_syscall_nr) {
-  if (!g_skel)
-    return -1;
-  int tp_fd = bpf_map__fd(g_skel->maps.thread_policy_map);
-  struct thread_key tk = {.tgid = tgid, .tid = tid};
-  return bpf_map_update_elem(tp_fd, &tk, &max_syscall_nr, BPF_ANY);
-}
 
-static void register_watched_lib(const char *path, uint32_t mod_id) {
-  if (g_n_watched_libs >= MAX_WATCHED_LIBS)
-    return;
-  strncpy(g_watched_libs[g_n_watched_libs].path, path, 511);
-  g_watched_libs[g_n_watched_libs].path[511] = '\0';
-  g_watched_libs[g_n_watched_libs].module_id = mod_id;
-  g_n_watched_libs++;
-
-  // Also add hash to lib_allow_map for dynamic load enforcement
-  if (g_skel) {
-    int la_fd = bpf_map__fd(g_skel->maps.lib_allow_map);
-    uint64_t hash = fnv1a_hash(path);
-    uint32_t v = 1;
-    bpf_map_update_elem(la_fd, &hash, &v, BPF_ANY);
-  }
-}
 
 // Scan /proc/PID/maps for new libraries not yet in our watch list.
 // Returns the number of newly discovered libraries.
-static int dlopen_scan(pid_t pid, int vma_fd, int registry_fd,
-                       uint32_t *next_mod_id, const char *bin_name,
-                       unsigned long libc_base,
-                       char **app_imports, int nimports) {
-  char maps_path[64], line[512];
-  snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
-  FILE *fp = fopen(maps_path, "r");
-  if (!fp)
-    return 0;
-
-  int new_libs = 0;
-  while (fgets(line, sizeof(line), fp)) {
-    if (!strstr(line, "r-xp") && !strstr(line, "r--p"))
-      continue;
-    char *path = strchr(line, '/');
-    if (!path)
-      continue;
-    char *nl = strchr(path, '\n');
-    if (nl)
-      *nl = '\0';
-
-    // Skip known modules
-    if (strstr(path, bin_name))
-      continue;
-    if (strstr(path, "/libc.so") || strstr(path, "/libc-"))
-      continue;
-    if (strstr(path, "ld-linux") || strstr(path, "ld-musl"))
-      continue;
-    if (!strstr(path, ".so"))
-      continue;
-    if (strstr(path, "ld.so.cache") || strstr(path, "locale-archive") ||
-        strstr(path, "gconv-modules"))
-      continue;
-
-    // Already tracked?
-    if (is_lib_watched(path))
-      continue;
-
-    // New library discovered! (likely via dlopen)
-    const char *short_name = strrchr(path, '/');
-    short_name = short_name ? short_name + 1 : path;
-
-    if (*next_mod_id >= 64)
-      continue;
-
-    char map_name[16];
-    snprintf(map_name, sizeof(map_name), "dl_pol_%u", *next_mod_id);
-    int lib_map_fd = bpf_map_create(BPF_MAP_TYPE_HASH, map_name,
-                                    sizeof(uint64_t), sizeof(uint64_t),
-                                    4096, NULL);
-    if (lib_map_fd < 0)
-      continue;
-
-    uint32_t mod_id = *next_mod_id;
-    if (bpf_map_update_elem(registry_fd, &mod_id, &lib_map_fd, BPF_ANY) != 0) {
-      close(lib_map_fd);
-      continue;
-    }
-
-    unsigned long lib_base = 0;
-    int lib_blocks = populate_vma_for_module(vma_fd, pid, short_name,
-                                             mod_id, &lib_base);
-
-    // Call-graph-guided filtering (or fallback to full scan)
-    uint64_t sites[512];
-    int nsites = 0;
-    int reachable = 0;
-    if (app_imports && nimports > 0)
-      nsites = trace_lib_callgraph(path, app_imports, nimports,
-                                   sites, 512, &reachable);
-    if (nsites == 0)
-      nsites = scan_elf_text_for_syscalls(path, sites, 512);
-    int added = 0;
-    for (int j = 0; j < nsites; j++) {
-      uint64_t val = 1; // Wildcard
-      if (bpf_map_update_elem(lib_map_fd, &sites[j], &val, BPF_ANY) == 0)
-        added++;
-    }
-
-    printf("[Loader] dlopen() detected: '%s' (mod=%u, base=0x%lx, "
-           "%d blocks, %d sites)\n",
-           short_name, mod_id, lib_base, lib_blocks, added);
-
-    register_watched_lib(path, mod_id);
-    close(lib_map_fd);
-    (*next_mod_id)++;
-    new_libs++;
-  }
-  fclose(fp);
-  return new_libs;
-}
 
 // =============================================================================
 // Attack Surface Report
 // =============================================================================
-static const char *subsys_name(int subsys) {
-  switch (subsys) {
-  case SUBSYS_PROCESS:    return "process";
-  case SUBSYS_FILESYSTEM: return "filesystem";
-  case SUBSYS_NETWORK:    return "network";
-  case SUBSYS_MEMORY:     return "memory";
-  case SUBSYS_IPC:        return "ipc";
-  case SUBSYS_SIGNAL:     return "signal";
-  case SUBSYS_DEVICE:     return "device";
-  case SUBSYS_SECURITY:   return "security";
-  default:                return "other";
-  }
-}
 
 // Map x86-64 syscall NR -> kernel subsystem
-static int nr_to_subsystem(uint32_t nr) {
-  switch (nr) {
-  // Process
-  case 56: case 57: case 58: case 59: case 60: case 61: case 62:
-  case 157: case 160: case 231: case 272: case 435:
-    return SUBSYS_PROCESS;
-  // Filesystem
-  case 0: case 1: case 2: case 3: case 4: case 5: case 6: case 8:
-  case 17: case 18: case 19: case 20: case 21: case 76: case 77:
-  case 78: case 79: case 80: case 82: case 83: case 84: case 85: case 86:
-  case 87: case 88: case 89: case 90: case 133: case 155: case 161:
-  case 217: case 257: case 258: case 259: case 260: case 261: case 262:
-  case 263: case 264: case 265: case 266: case 267: case 268: case 269:
-  case 316: case 437: case 438: case 439: case 440:
-    return SUBSYS_FILESYSTEM;
-  // Network
-  case 41: case 42: case 43: case 44: case 45: case 46: case 47: case 48:
-  case 49: case 50: case 51: case 52: case 53: case 54: case 55:
-  case 288: case 289: case 290: case 291: case 292: case 293:
-    return SUBSYS_NETWORK;
-  // Memory
-  case 9: case 10: case 11: case 12: case 25: case 26: case 27: case 28:
-  case 67: case 237: case 278: case 279:
-    return SUBSYS_MEMORY;
-  // IPC
-  case 22: case 23: case 29: case 30: case 31: case 32: case 33: case 66:
-    return SUBSYS_IPC;
-  // Signal
-  case 13: case 14: case 15: case 34: case 35: case 127: case 128: case 129:
-  case 130: case 131:
-    return SUBSYS_SIGNAL;
-  // Device
-  case 16: case 73: case 187:
-    return SUBSYS_DEVICE;
-  // Security
-  case 101: case 246: case 317:
-    return SUBSYS_SECURITY;
-  default:
-    return SUBSYS_OTHER;
-  }
-}
 
-static void print_attack_surface(int policy_fd, int n_entries,
-                                 const char *binary) {
-  printf("\n=========================================================\n");
-  printf("  Sentinel-CC Attack Surface Report — %s\n", binary);
-  printf("=========================================================\n\n");
-
-  int subsys_counts[SUBSYS_OTHER + 1] = {0};
-  int total_nrs = 0;
-  uint64_t key = 0, next_key = 0;
-  while (bpf_map_get_next_key(policy_fd, &key, &next_key) == 0) {
-    uint64_t val = 0;
-    bpf_map_lookup_elem(policy_fd, &next_key, &val);
-    if (val & POLICY_FLAG_CHECK_NR) {
-      uint32_t nr = (uint32_t)(val & 0xFFFFFFFF);
-      int subsys = nr_to_subsystem(nr);
-      subsys_counts[subsys]++;
-      total_nrs++;
-    }
-    key = next_key;
-  }
-
-  printf("  Total policy entries: %d\n", n_entries);
-  printf("  Entries with syscall NR: %d\n", total_nrs);
-  printf("  Total x86-64 syscalls: ~350\n\n");
-  printf("  %-14s  Count  Exposure\n", "Subsystem");
-  printf("  %-14s  -----  --------\n", "----------");
-  for (int s = 0; s <= SUBSYS_OTHER; s++) {
-    if (subsys_counts[s] > 0) {
-      printf("  %-14s  %5d  ", subsys_name(s), subsys_counts[s]);
-      // Visual bar
-      for (int b = 0; b < subsys_counts[s] && b < 40; b++)
-        putchar('#');
-      putchar('\n');
-    }
-  }
-  printf("\n  Attack surface: %d/%d NRs reachable (%.1f%% of kernel)\n",
-         total_nrs, 350, total_nrs * 100.0 / 350.0);
-  printf("=========================================================\n\n");
-}
 
 // =============================================================================
 // CLI
@@ -1882,6 +1080,7 @@ static void print_usage(const char *prog) {
 // MAIN
 // =============================================================================
 int main(int argc, char **argv) {
+  int nimports = 0;
   setbuf(stdout, NULL);
   setbuf(stderr, NULL);
 
@@ -1903,14 +1102,7 @@ int main(int argc, char **argv) {
       audit_mode = 1;
       arg_start = i + 1;
       continue;
-    }
-    if (strcmp(argv[i], "--fexit") == 0) {
-      fexit_mode = 1;
-      audit_mode = 1; // fexit implies audit
-      arg_start = i + 1;
-      continue;
-    }
-    if (strcmp(argv[i], "--permissive") == 0) {
+    }    if (strcmp(argv[i], "--permissive") == 0) {
       g_enforce_mode = ENFORCE_PERMISSIVE;
       audit_mode = 1; // permissive implies audit (must see violations)
       arg_start = i + 1;
@@ -1931,65 +1123,7 @@ int main(int argc, char **argv) {
       g_enforce_mode = ENFORCE_TERM;
       arg_start = i + 1;
       continue;
-    }
-    if (strcmp(argv[i], "--watch-dlopen") == 0) {
-      g_watch_dlopen = 1;
-      arg_start = i + 1;
-      continue;
-    }
-    if (strcmp(argv[i], "--learn") == 0) {
-      g_learn_mode = 1;
-      g_enforce_mode = ENFORCE_PERMISSIVE;
-      audit_mode = 1;
-      arg_start = i + 1;
-      continue;
-    }
-    if (strcmp(argv[i], "--shadow-cfi") == 0) {
-      g_shadow_cfi = 1;
-      arg_start = i + 1;
-      continue;
-    }
-    if (strcmp(argv[i], "--system-wide") == 0) {
-      g_system_wide = 1;
-      arg_start = i + 1;
-      continue;
-    }
-    if (strcmp(argv[i], "--surface") == 0) {
-      g_surface_report = 1;
-      arg_start = i + 1;
-      continue;
-    }
-    if (strcmp(argv[i], "--tpm") == 0) {
-      g_use_tpm = 1;
-      arg_start = i + 1;
-      continue;
-    }
-    if (strncmp(argv[i], "--cgroup=", 9) == 0) {
-      strncpy(g_cgroup_path, argv[i] + 9, sizeof(g_cgroup_path) - 1);
-      arg_start = i + 1;
-      continue;
-    }
-    if (strcmp(argv[i], "--audit-format=json") == 0) {
-      g_audit_fmt = AUDIT_FMT_JSON;
-      arg_start = i + 1;
-      continue;
-    }
-    if (strcmp(argv[i], "--audit-format=text") == 0) {
-      g_audit_fmt = AUDIT_FMT_TEXT;
-      arg_start = i + 1;
-      continue;
-    }
-    if (strcmp(argv[i], "--audit-target=syslog") == 0) {
-      g_audit_tgt = AUDIT_TGT_SYSLOG;
-      arg_start = i + 1;
-      continue;
-    }
-    if (strcmp(argv[i], "--audit-target=stdout") == 0) {
-      g_audit_tgt = AUDIT_TGT_STDOUT;
-      arg_start = i + 1;
-      continue;
-    }
-    // First non-flag argument is the binary
+    }    // First non-flag argument is the binary
     arg_start = i;
     break;
   }
@@ -1998,20 +1132,17 @@ int main(int argc, char **argv) {
     fprintf(stderr, "[FATAL] No binary specified. Use --help for usage.\n");
     return 1;
   }
-
-  // Open syslog if requested
-  if (g_audit_tgt == AUDIT_TGT_SYSLOG)
-    openlog("sentinel", LOG_PID | LOG_NDELAY, LOG_DAEMON);
-
   const char *binary = argv[arg_start];
 
   // --- Install signal handlers for cleanup ---
   install_signal_handlers();
 
-  // --- 1. Verify Signature (returns open fd for TOCTOU-safe exec) ---
-  int verified_fd = verify_signature(binary);
-  if (verified_fd < 0)
-    return 1;
+  // No Signature Verification, but we need an fd for fexecve
+  int verified_fd = open(binary, O_RDONLY | O_CLOEXEC);
+  if (verified_fd < 0) {
+      perror("[FATAL] open binary");
+      return 1;
+  }
 
   // --- 2. Parse .sentinel section from binary (the Policy-Carrying Code!) ---
   uint64_t policy_offsets[MAX_POLICY_ENTRIES];
@@ -2040,14 +1171,11 @@ int main(int argc, char **argv) {
   if (!g_skel) {
     fprintf(stderr, "[FATAL] Failed to open BPF skeleton.\n");
     return 1;
+  }  g_skel->rodata->audit_mode = audit_mode ? 1 : 0;  g_skel->rodata->enforce_mode = g_enforce_mode;
+  int inner_fd = bpf_create_map(BPF_MAP_TYPE_HASH, sizeof(uint64_t), sizeof(uint64_t), 4096, 0);
+  if (inner_fd >= 0) {
+    bpf_map__set_inner_map_fd(g_skel->maps.policy_registry, inner_fd);
   }
-  g_skel->rodata->cgroup_filter = (g_cgroup_path[0] != '\0') ? 1 : 0;
-  g_skel->rodata->audit_mode = audit_mode ? 1 : 0;
-  g_skel->rodata->fexit_mode = fexit_mode ? 1 : 0;
-  g_skel->rodata->enforce_mode = g_enforce_mode;
-  g_skel->rodata->learn_mode = g_learn_mode ? 1 : 0;
-  g_skel->rodata->shadow_cfi = g_shadow_cfi ? 1 : 0;
-  g_skel->rodata->system_wide = g_system_wide ? 1 : 0;
   if (sentinel_bpf__load(g_skel)) {
     fprintf(stderr, "[FATAL] Failed to load BPF programs.\n");
     sentinel_bpf__destroy(g_skel);
@@ -2066,25 +1194,7 @@ int main(int argc, char **argv) {
    
 
   // --- Populate cgroup map if --cgroup specified ---
-  if (g_cgroup_path[0] != '\0') {
-    // Get cgroup ID by stat()ing the cgroup directory
-    struct stat cg_stat;
-    if (stat(g_cgroup_path, &cg_stat) == 0) {
-      uint64_t cgid = (uint64_t)cg_stat.st_ino;
-      uint32_t val = 1;
-      int cg_fd = bpf_map__fd(g_skel->maps.cgroup_map);
-      if (bpf_map_update_elem(cg_fd, &cgid, &val, BPF_ANY) == 0) {
-        printf("[Loader] Cgroup filter: %s (id=%lu)\n",
-               g_cgroup_path, (unsigned long)cgid);
-      } else {
-        fprintf(stderr, "[Warn] Failed to add cgroup ID: %s\n",
-                strerror(errno));
-      }
-    } else {
-      fprintf(stderr, "[Warn] Cannot stat cgroup path '%s': %s\n",
-              g_cgroup_path, strerror(errno));
-    }
-  } printf("[Loader] Enforcement mode: %s\n", mode_str);
+   printf("[Loader] Enforcement mode: %s\n", mode_str);
   }
 
   // --- 4. Setup audit ring buffer if requested ---
@@ -2195,8 +1305,8 @@ int main(int argc, char **argv) {
 
   // Main binary policy map
   int main_map_fd =
-      bpf_map_create(BPF_MAP_TYPE_HASH, "main_policy", sizeof(uint64_t),
-                     sizeof(uint64_t), 4096, NULL);
+      bpf_create_map(BPF_MAP_TYPE_HASH, sizeof(uint64_t),
+                     sizeof(uint64_t), 4096, 0);
   if (main_map_fd < 0) {
     fprintf(stderr, "[FATAL] Failed to create main policy map: %s\n",
             strerror(errno));
@@ -2242,23 +1352,16 @@ int main(int argc, char **argv) {
          policy_count);
 
   // --- Attack surface report mode ---
-  if (g_surface_report) {
-    print_attack_surface(main_map_fd, loaded, binary);
-    kill(g_child, SIGKILL);
-    waitpid(g_child, NULL, 0);
-    goto cleanup;
-  }
 
   // --- 10. Resolve and populate libc policy dynamically ---
   // Parse .sentinel_imports for call-graph-guided filtering
   char **app_imports = NULL;
   char *imports_blob = NULL;
-  int nimports = parse_sentinel_imports(binary, &app_imports, &imports_blob);
-
+  
   if (libc_base != 0) {
     int libc_map_fd =
-        bpf_map_create(BPF_MAP_TYPE_HASH, "libc_policy", sizeof(uint64_t),
-                       sizeof(uint64_t), 4096, NULL);
+      bpf_create_map(BPF_MAP_TYPE_HASH, sizeof(uint64_t),
+                     sizeof(uint64_t), 4096, 0);
     if (libc_map_fd < 0) {
       fprintf(stderr, "[Warn] Failed to create libc policy map.\n");
     } else {
@@ -2280,7 +1383,7 @@ int main(int argc, char **argv) {
         // =================================================================
         // Per-App Libc Filtering: Call-Graph-Guided Whitelist
         // =================================================================
-        if (nimports > 0) {
+        if (0) {
           printf("[Loader] Per-app libc filtering: %d imports from "
                  ".sentinel_imports\n", nimports);
 
@@ -2617,9 +1720,9 @@ libc_ld_whitelist:
         // Create inner policy map for this library
         char map_name[16];
         snprintf(map_name, sizeof(map_name), "lib_pol_%u", next_mod_id);
-        int lib_map_fd = bpf_map_create(BPF_MAP_TYPE_HASH, map_name,
+        int lib_map_fd = bpf_create_map(BPF_MAP_TYPE_HASH,
                                         sizeof(uint64_t), sizeof(uint64_t),
-                                        4096, NULL);
+                                        4096, 0);
         if (lib_map_fd < 0) {
           fprintf(stderr, "[Warn] Failed to create policy map for %s: %s\n",
                   short_name, strerror(errno));
@@ -2646,10 +1749,8 @@ libc_ld_whitelist:
         uint64_t sites[512];
         int nsites = 0;
         int reachable = 0;
-        if (app_imports && nimports > 0) {
-          nsites = trace_lib_callgraph(lib_path, app_imports, nimports,
-                                       sites, 512, &reachable);
-        }
+        if (0) {
+                  }
         // Fallback: full-text scan if no imports or BFS found nothing
         if (nsites == 0)
           nsites = scan_elf_text_for_syscalls(lib_path, sites, 512);
@@ -2677,8 +1778,7 @@ libc_ld_whitelist:
                reachable > 0 ? "call-graph" : "full-scan", reduction);
 
         // Track for dlopen() change detection
-        register_watched_lib(lib_path, mod_id);
-
+        
         close(lib_map_fd);
         next_mod_id++;
       }
@@ -2701,9 +1801,7 @@ libc_ld_whitelist:
   // Also register main binary and libc paths so dlopen scanner skips them
   {
     char main_full[512];
-    if (realpath(binary, main_full))
-      register_watched_lib(main_full, MODULE_MAIN);
-  }
+    }
 
   // --- 11. Setup CFI policy ---
   // First try generalized CFI from .sentinel_cfi section (covers ALL functions)
@@ -2791,60 +1889,7 @@ libc_ld_whitelist:
   printf("[Loader] Policy loaded. Detaching child (PID=%d).\n", g_child);
 
   // --- 12b. Populate system-wide fallback policy if requested ---
-  if (g_system_wide) {
-    // Allow a baseline set of safe syscalls for ALL processes
-    static const uint32_t safe_nrs[] = {
-      0,   // read
-      1,   // write
-      3,   // close
-      5,   // fstat
-      8,   // lseek
-      9,   // mmap
-      10,  // mprotect
-      11,  // munmap
-      12,  // brk
-      13,  // rt_sigaction
-      14,  // rt_sigprocmask
-      15,  // rt_sigreturn
-      21,  // access
-      24,  // sched_yield
-      35,  // nanosleep
-      39,  // getpid
-      60,  // exit
-      63,  // uname
-      72,  // fcntl
-      79,  // getcwd
-      89,  // readlink
-      96,  // gettimeofday
-      102, // getuid
-      104, // getgid
-      107, // geteuid
-      108, // getegid
-      110, // getppid
-      158, // arch_prctl
-      186, // gettid
-      202, // futex
-      218, // set_tid_address
-      228, // clock_gettime
-      231, // exit_group
-      257, // openat
-      262, // newfstatat
-      302, // prlimit64
-      318, // getrandom
-      334, // rseq
-    };
-    int fb_fd = bpf_map__fd(g_skel->maps.fallback_policy);
-    int fb_count = 0;
-    for (size_t j = 0; j < sizeof(safe_nrs) / sizeof(safe_nrs[0]); j++) {
-      uint32_t nr = safe_nrs[j];
-      uint32_t v = 1;
-      if (bpf_map_update_elem(fb_fd, &nr, &v, BPF_ANY) == 0)
-        fb_count++;
-    }
-    printf("[Loader] System-wide fallback: %d baseline syscalls allowed.\n",
-           fb_count);
-  }
-
+  
   ptrace(PTRACE_DETACH, g_child, NULL, NULL);
 
   // --- 13. Wait for child with optional audit polling ---
@@ -2898,19 +1943,7 @@ libc_ld_whitelist:
       ring_buffer__poll(rb, 100 /* ms */);
 
       // dlopen() monitoring: periodically check for new libraries
-      if (g_watch_dlopen) {
-        static int dlopen_poll_counter = 0;
-        if (++dlopen_poll_counter >= (DLOPEN_SCAN_INTERVAL_MS / 100)) {
-          dlopen_poll_counter = 0;
-          int new_libs = dlopen_scan(g_child, vma_fd, registry_fd,
-                                     &dlopen_next_mod_id, bin_name, libc_base,
-                                     app_imports, nimports);
-          if (new_libs > 0)
-            printf("[Loader] dlopen watch: %d new libraries discovered.\n",
-                   new_libs);
-        }
-      }
-    }
+          }
     ring_buffer__free(rb);
     rb = NULL;
   } else {
@@ -2923,36 +1956,7 @@ libc_ld_whitelist:
   }
 
   // --- Learning mode: dump observed profile to policy file ---
-  if (g_learn_mode) {
-    int learn_fd = bpf_map__fd(g_skel->maps.learn_map);
-    char policy_path[512];
-    snprintf(policy_path, sizeof(policy_path), "%s.learned.policy", binary);
-    FILE *pf = fopen(policy_path, "w");
-    if (pf) {
-      fprintf(pf, "# Sentinel-CC Learned Policy (v%s)\n", SENTINEL_VERSION);
-      fprintf(pf, "# Binary: %s\n", binary);
-      fprintf(pf, "# Format: offset syscall_nr module_id\n\n");
-      uint64_t key = 0, next_key = 0;
-      int entries = 0;
-      while (bpf_map_get_next_key(learn_fd, &key, &next_key) == 0) {
-        uint64_t val = 0;
-        if (bpf_map_lookup_elem(learn_fd, &next_key, &val) == 0) {
-          uint32_t mod_id = (uint32_t)(val >> 32);
-          uint32_t nr = (uint32_t)(val & 0xFFFFFFFF);
-          fprintf(pf, "0x%lx %u %u\n", (unsigned long)next_key, nr, mod_id);
-          entries++;
-        }
-        key = next_key;
-      }
-      fclose(pf);
-      printf("[Loader] Learning mode: wrote %d entries to %s\n",
-             entries, policy_path);
-    } else {
-      fprintf(stderr, "[WARN] Could not create learned policy file: %s\n",
-              strerror(errno));
-    }
-  }
-
+  
   // Fall through to cleanup
 cleanup:
   close(main_map_fd);
@@ -2960,8 +1964,6 @@ cleanup:
     sentinel_bpf__destroy(g_skel);
     g_skel = NULL;
   }
-  if (g_audit_tgt == AUDIT_TGT_SYSLOG)
-    closelog();
   printf("[Loader] Cleanup complete.\n");
   return 0;
 }

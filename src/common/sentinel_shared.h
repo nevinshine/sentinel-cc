@@ -46,27 +46,30 @@
 #define EVENT_CFI_FAIL    3
 #define EVENT_NR_MISMATCH 4
 #define EVENT_FORK_TRACK  5  // Child auto-enrolled via sched_process_fork
-#define EVENT_FEXIT_OK    6  // Post-syscall return audit (fexit)
-#define EVENT_DLOPEN_EXT  7  // Runtime dlopen() policy extension
-#define EVENT_PERMISSIVE  8  // Violation logged in permissive mode (not killed)
-#define EVENT_LEARN       9  // Learning mode: observed syscall recorded
-#define EVENT_LIB_DENY   10  // Unauthorized library load denied
-#define EVENT_SHADOW_OK  11  // Shadow stack validation passed
-#define EVENT_SHADOW_FAIL 12 // Shadow stack validation failed
-#define EVENT_FALLBACK   13  // System-wide fallback policy applied
-#define EVENT_KOBJ_DENY  14  // Kernel object manipulation denied (bpf/unshare/setns)
 
-// --- Max constants ---
-#define MAX_SHADOW_DEPTH 8  // Max stack frames for shadow stack CFI
 // --- Phase 3: Policy value encoding ---
 // Bit 32 = validate syscall number; bits 0-31 = expected syscall number
 // If bit 32 is clear, policy value == 1 means "wildcard — allow any nr"
 #define POLICY_FLAG_CHECK_NR (1ULL << 32)
 
 // --- Policy Format Version ---
-// Magic bytes + version at the start of .sentinel section
-#define SENTINEL_POLICY_MAGIC   0x53454E54U  // "SENT"
-#define SENTINEL_POLICY_VERSION 2            // Format version (v2 adds NR binding)
+// Magic bytes + version at the start of .llvm.syscall.bounds section
+#define SENTINEL_POLICY_MAGIC   0x4E45537FU  // "\x7FSEN" (Little-endian for \x7F S E N)
+#define SENTINEL_POLICY_VERSION 1            // Semantic metadata format version 1
+
+// 1. The Header (9 bytes packed)
+struct sentinel_header {
+  char magic[4];       // Must be "\x7FSEN"
+  S_U8 version;        // Currently 1
+  S_U32 count;         // Number of policy_entry items following this header
+} __attribute__((packed));
+
+// 2. The Entry (24 bytes packed)
+struct policy_entry {
+  S_U64 site_addr;     // The LLVM BlockAddress representing the syscall site
+  S_U64 func_addr;     // The address of the enclosing function
+  S_U64 syscall_nr;    // Encoding: 0 = "any", >0 = (Syscall Number + 1)
+} __attribute__((packed));
 
 // --- Audit Event Structure ---
 // Transmitted via BPF ring buffer from kernel to userspace.
@@ -101,23 +104,7 @@ struct cfi_range {
   S_U64 end;
 };
 
-// --- Thread Policy Key (for per-thread enforcement) ---
-struct thread_key {
-  S_U32 tgid;
-  S_U32 tid;
-};
 
-// --- Kernel Subsystem Mapping ---
-// Maps syscall numbers to kernel subsystem categories for attack surface reports
-#define SUBSYS_PROCESS   0  // fork, execve, exit, prctl
-#define SUBSYS_FILESYSTEM 1 // open, read, write, close, stat
-#define SUBSYS_NETWORK   2  // connect, sendmsg, socket, bind
-#define SUBSYS_MEMORY    3  // mmap, mprotect, brk
-#define SUBSYS_IPC       4  // pipe, shmget, msgget
-#define SUBSYS_SIGNAL    5  // kill, sigaction
-#define SUBSYS_DEVICE    6  // ioctl, read/write on devices
-#define SUBSYS_SECURITY  7  // seccomp, ptrace, keyctl
-#define SUBSYS_OTHER     8
 
 // --- Compile-time struct size assertions ---
 // These catch layout divergence at build time rather than at runtime.
@@ -130,8 +117,7 @@ _Static_assert(sizeof(struct vma_value) == 12,
                "vma_value size mismatch — check padding");
 _Static_assert(sizeof(struct cfi_range) == 16,
                "cfi_range size mismatch");
-_Static_assert(sizeof(struct thread_key) == 8,
-               "thread_key size mismatch");
+
 #endif
 
 #endif // SENTINEL_SHARED_H
