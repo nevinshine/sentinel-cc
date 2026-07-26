@@ -27,13 +27,7 @@ void unsafe() {
                : "rcx", "r11", "memory");
 }
 
-// Force linker to keep the signature section
-extern char __sentinel_signature[];
-
 int main() {
-  // Create a reference to the signature so linker doesn't strip it
-  // The Pass will provide the definition.
-  __asm__ volatile("" : : "r"(__sentinel_signature));
 
   safe_logger();
   unsafe();

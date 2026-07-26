@@ -659,6 +659,14 @@ $ curl http://127.0.0.1:8899/
 <p>This HTTP server is running under eBPF enforcement.</p></body></html>
 ```
 
+#### Macrobenchmarks
+
+| Application | Native | Sentinel | Overhead (%) | Notes |
+|-------------|--------|----------|--------------|-------|
+| **SQLite** (ops/s) | 3,361,119 ± 861,707 | 2,941,217 ± 533,796 | 12.49% | Fully instrumented statically linked binary |
+| **Redis** (ops/s) | 103,614 ± 929 | 102,805 ± 979 | 0.78% | System-wide fallback mode (fast-path bypass) |
+| **Curl** (MB/s) | 1,400 ± 185 | 1,404 ± 147 | -0.34% | System-wide fallback mode (fast-path bypass) |
+
 #### Multi-Workload Summary
 
 | Workload | Type | Syscalls | Overhead | Notes |

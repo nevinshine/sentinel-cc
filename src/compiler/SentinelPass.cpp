@@ -255,7 +255,7 @@ struct SentinelPass : public PassInfoMixin<SentinelPass> {
       if (F.isDeclaration() && F.hasName() && !F.use_empty()) {
         StringRef Name = F.getName();
         // Skip LLVM/compiler intrinsics (llvm.*, __cxa_*, __stack_chk_*)
-        if (Name.starts_with("llvm."))
+        if (Name.startswith("llvm."))
           continue;
         ExternalImports.insert(Name.str());
       }
@@ -317,7 +317,7 @@ struct SentinelPass : public PassInfoMixin<SentinelPass> {
       CFIEntries.push_back({SiteLabel, FuncPtr, 0}); // Size filled at link
     }
 
-    // Step B: Create the Global Policy Array (Always, even if empty)
+    // Step B: Create the Global Policy Array with Header
     if (PolicyEntries.empty()) {
       errs() << "[Sentinel] No syscalls found. Creating dummy entry to prevent "
                 "stripping.\n";
@@ -328,56 +328,42 @@ struct SentinelPass : public PassInfoMixin<SentinelPass> {
       PolicyEntries.push_back(Dummy);
     }
 
+    // Header: { Magic[4], Version(i8), Count(i32) }
+    StructType *HeaderTy = StructType::create(Ctx, "struct.SentinelHeader");
+    HeaderTy->setBody({
+        ArrayType::get(Type::getInt8Ty(Ctx), 4), // Magic
+        Type::getInt8Ty(Ctx),                    // Version
+        Type::getInt32Ty(Ctx)                    // Count
+    }, true /* isPacked */);
+
+    std::vector<Constant*> MagicChars = {
+        ConstantInt::get(Type::getInt8Ty(Ctx), 0x7F),
+        ConstantInt::get(Type::getInt8Ty(Ctx), 'S'),
+        ConstantInt::get(Type::getInt8Ty(Ctx), 'E'),
+        ConstantInt::get(Type::getInt8Ty(Ctx), 'N')
+    };
+    Constant *MagicInit = ConstantArray::get(ArrayType::get(Type::getInt8Ty(Ctx), 4), MagicChars);
+    Constant *VersionInit = ConstantInt::get(Type::getInt8Ty(Ctx), 1);
+    Constant *CountInit = ConstantInt::get(Type::getInt32Ty(Ctx), PolicyEntries.size());
+    Constant *HeaderInit = ConstantStruct::get(HeaderTy, {MagicInit, VersionInit, CountInit});
+
     ArrayType *ArrayTy = ArrayType::get(PolicyEntryTy, PolicyEntries.size());
     Constant *ArrayInit = ConstantArray::get(ArrayTy, PolicyEntries);
 
-    GlobalVariable *PolicyTable =
-        new GlobalVariable(M, ArrayTy, true, GlobalValue::ExternalLinkage,
-                           ArrayInit, "__sentinel_policy");
+    StructType *SectionTy = StructType::create(Ctx, "struct.SentinelSection");
+    SectionTy->setBody({HeaderTy, ArrayTy}, true /* isPacked */);
+    Constant *SectionInit = ConstantStruct::get(SectionTy, {HeaderInit, ArrayInit});
 
-    PolicyTable->setSection(".sentinel");
-    PolicyTable->setAlignment(Align(16));
+    GlobalVariable *PolicyTable =
+        new GlobalVariable(M, SectionTy, true, GlobalValue::PrivateLinkage,
+                           SectionInit, "__sentinel_policy");
+
+    PolicyTable->setSection(".llvm.syscall.bounds");
+    PolicyTable->setAlignment(Align(1)); // Packed
 
     if (!PolicyEntries.empty()) {
       errs() << "[Sentinel] Injected " << PolicyEntries.size()
-             << " precise entries into .sentinel section.\n";
-    }
-
-    // 3. Inject Signature Placeholder (Reserve space for Signing Tool)
-    // 64 bytes for Ed25519 signature.
-    ArrayType *SigType = ArrayType::get(Type::getInt8Ty(Ctx), 64);
-    Constant *SigInit = ConstantAggregateZero::get(SigType);
-    GlobalVariable *SigVar =
-        new GlobalVariable(M, SigType, false, GlobalValue::ExternalLinkage,
-                           SigInit, "__sentinel_signature");
-    SigVar->setSection(".signature");
-    // SigVar->setUsedWithNoInlining(true); // Method does not exist in LLVM 15
-
-    // Handle Name Collision with 'extern' declaration in C
-    // If victim.c defines 'extern char __sentinel_signature[];', LLVM creates a
-    // declaration. Our 'new GlobalVariable' above will be renamed to
-    // '__sentinel_signature.2'. We must find the declaration, replace uses, and
-    // assume the name.
-    if (SigVar->getName() != "__sentinel_signature") {
-      GlobalVariable *OldVar = M.getGlobalVariable("__sentinel_signature");
-      if (OldVar) {
-        // Replace references (e.g. in main's inline asm) with new var
-        // Cast NewVar to OldVar's type if needed (Opaque Pointers -> just ptr)
-
-        // For Opaque Pointers (LLVM 15), types are implicit in instructions.
-        // But Value->getType() is still a PointerType.
-        // If they match (both ptr), direct replacement.
-        if (OldVar->getType() == SigVar->getType()) {
-          OldVar->replaceAllUsesWith(SigVar);
-        } else {
-          // Should not happen with minimal opaque pointers, but for safety:
-          // ConstantExpr::getBitCast(SigVar, OldVar->getType())
-          // But BitCast is deprecated for opaque.
-          OldVar->replaceAllUsesWith(SigVar);
-        }
-        OldVar->eraseFromParent();
-        SigVar->setName("__sentinel_signature");
-      }
+             << " precise entries into .llvm.syscall.bounds section.\n";
     }
 
     // Add to llvm.used to prevent compiler stripping
@@ -390,80 +376,10 @@ struct SentinelPass : public PassInfoMixin<SentinelPass> {
       }
       LLVMUsed->eraseFromParent();
     }
-    // Cast SigVar to i8* (void*) for llvm.used
-    // LLVM 15+ Opaque Pointers: Use PointerType::getUnqual(Ctx)
-    Constant *SigCast =
-        ConstantExpr::getBitCast(SigVar, PointerType::getUnqual(Ctx));
-    UsedArray.push_back(SigCast);
 
-    // Also add PolicyTable to llvm.used so it isn't stripped
-    if (PolicyTable) {
-      Constant *PolicyCast =
-          ConstantExpr::getBitCast(PolicyTable, PointerType::getUnqual(Ctx));
-      UsedArray.push_back(PolicyCast);
-    }
-
-    // 4. Emit .sentinel_imports — external function call list for per-app
-    //    libc filtering. Format: null-terminated strings concatenated.
-    //    Loader uses this to restrict libc whitelist to reachable functions.
-    GlobalVariable *ImportsVar = nullptr;
-    if (!ExternalImports.empty()) {
-      std::string ImportBlob;
-      for (const auto &Name : ExternalImports) {
-        ImportBlob += Name;
-        ImportBlob.push_back('\0');
-      }
-
-      Constant *ImportsInit = ConstantDataArray::getString(Ctx, ImportBlob,
-                                                           false);
-      ImportsVar = new GlobalVariable(M, ImportsInit->getType(), true,
-                                      GlobalValue::ExternalLinkage,
-                                      ImportsInit, "__sentinel_imports");
-      ImportsVar->setSection(".sentinel_imports");
-      ImportsVar->setAlignment(Align(1));
-
-      Constant *ImportsCast =
-          ConstantExpr::getBitCast(ImportsVar, PointerType::getUnqual(Ctx));
-      UsedArray.push_back(ImportsCast);
-
-      errs() << "[Sentinel] Emitted " << ExternalImports.size()
-             << " external imports into .sentinel_imports section.\n";
-    }
-
-    // 5. Emit .sentinel_cfi — per-site caller ranges for generalized CFI.
-    //    Format: array of { void *site, void *func_start, void *func_start }
-    //    At runtime, the loader reads func symbol sizes from the ELF to
-    //    compute [func_start, func_start+size) as the valid caller range.
-    //    Here we store {site, func, func} as the linker resolves addresses.
-    GlobalVariable *CfiVar = nullptr;
-    if (!CFIEntries.empty()) {
-      StructType *CfiEntryTy = StructType::create(Ctx, "struct.SentinelCFI");
-      CfiEntryTy->setBody({VoidPtrTy, VoidPtrTy});
-
-      std::vector<Constant *> CfiConsts;
-      for (auto &E : CFIEntries) {
-        Constant *FPtr = E.FuncPtr;
-        if (FPtr->getType() != VoidPtrTy)
-          FPtr = ConstantExpr::getBitCast(FPtr, VoidPtrTy);
-        Constant *C = ConstantStruct::get(CfiEntryTy, {E.SiteLabel, FPtr});
-        CfiConsts.push_back(C);
-      }
-
-      ArrayType *CfiArrTy = ArrayType::get(CfiEntryTy, CfiConsts.size());
-      Constant *CfiInit = ConstantArray::get(CfiArrTy, CfiConsts);
-      CfiVar = new GlobalVariable(M, CfiArrTy, true,
-                                  GlobalValue::ExternalLinkage,
-                                  CfiInit, "__sentinel_cfi");
-      CfiVar->setSection(".sentinel_cfi");
-      CfiVar->setAlignment(Align(16));
-
-      Constant *CfiCast =
-          ConstantExpr::getBitCast(CfiVar, PointerType::getUnqual(Ctx));
-      UsedArray.push_back(CfiCast);
-
-      errs() << "[Sentinel] Emitted " << CFIEntries.size()
-             << " CFI entries into .sentinel_cfi section.\n";
-    }
+    Constant *PolicyCast =
+        ConstantExpr::getBitCast(PolicyTable, PointerType::getUnqual(Ctx));
+    UsedArray.push_back(PolicyCast);
 
     ArrayType *ATy =
         ArrayType::get(PointerType::getUnqual(Ctx), UsedArray.size());
